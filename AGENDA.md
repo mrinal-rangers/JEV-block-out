@@ -24,45 +24,49 @@ Android emulator — without rebuilding the game.
 > Status of each step is tracked in [CHECKPOINTS.md](./CHECKPOINTS.md).
 
 ### M0 — Environment spike (go/no-go)
-- [ ] Install Android Studio + SDK platform-tools; create Android 13 x86_64 *Google APIs* AVD (rootable).
-- [ ] `adb install-multiple` base + `config.armeabi_v7a` splits; confirm game runs under ARM translation.
-- [ ] `adb root` and locate cached level files under the app's data dir.
-- [ ] Test Frida (gadget in APK and/or frida-server) against the translated process.
-- [ ] **Decision:** Path A (Frida hook) or Path B (level files + screen parsing).
+- [x] Install Android SDK + JDK 17; create **API 30** x86_64 *Google APIs* AVD (rootable).
+- [x] `adb install-multiple` base + `config.armeabi_v7a` splits; game runs under ARM translation.
+- [ ] Play a level by hand over adb — **blocked until the owner accepts the game's ToS**.
+- [x] Locate level files → they are TextAssets inside the APK, not app data.
+- [x] Test Frida → crashes the translated process (negative result).
+- [x] **Decision: Path B+** (level files + own rules engine; screenshots only to verify).
 
 ### M1 — Game state extraction
-- [ ] Dump IL2CPP types (Il2CppDumper) and map board/block/door/elevator/generator models.
-- [ ] Path A: hook script that emits board state JSON on each turn.
-- [ ] Path B: level-file parser + OpenCV board parser from screenshots.
-- [ ] Define a stable `GameState` JSON schema shared by both paths.
+- [x] Dump IL2CPP types and map `LevelModel` (blocks, doors, walls, feature arrays).
+- [x] Level-file parser (`packages/core/src/level.ts`) + rules engine (`engine.ts`).
+- [x] Stable `GameState` JSON schema (`schema/`).
+- [ ] Check engine state against the screen on device (after ToS).
 
 ### M2 — Move execution
-- [ ] Enumerate legal moves (game's `CanMove` in Path A; grid rules in Path B).
-- [ ] Execute a move (invoke game method or `adb shell input swipe`).
-- [ ] Detect move completion, level win, level fail.
+- [x] Enumerate legal moves (own grid rules; slides + exits, ice, axis, layers).
+- [x] Execute a move as an adb touch drag; detect settle from screenshots.
+- [x] Detect win / stuck / loops in the runner.
+- [ ] Verify on device (after ToS).
 
 ### M3 — Jev integration
-- [ ] Bridge (Node/TS) with TypeSafe SDK; key from `TYPESAFE_API_KEY`.
-- [ ] Questions: `Choice` (next move), `Score` (progress), `Noul` (dead end?).
-- [ ] Confidence routing: low confidence → short lookahead / re-ask.
-- [ ] Log every call: state, options, probabilities, confidence, latency, tokens.
+- [x] Bridge (Node/TS) with `@typesafe-ai/sdk`; key from `TYPESAFE_API_KEY`.
+- [x] Questions: `Choice` (next move), `Score` (progress), `Noul` (dead end?).
+- [x] Confidence routing: low confidence → re-ask top 5 → solver fallback.
+- [x] Log every call: state, options, probabilities, confidence, latency, tokens (JSONL).
+- [ ] First real Jev solve (needs API key).
 
 ### M4 — Live simulation dashboard
-- [ ] Vite + React dashboard: current state, move options with probabilities, chosen move, timing.
-- [ ] scrcpy mirror side-by-side; one-command `start` script.
+- [x] Browser viewer over SSE: board animation, option probabilities, confidence, latency.
+- [ ] Cost display, scrcpy mirror side-by-side, one-command `start` script.
 - [ ] Record demo video/GIF for the README.
 
 ### M5 — Harder mechanics & evaluation
-- [ ] Support elevators, generators, ice/locked blocks, arrows, bombs.
-- [ ] Metrics: levels solved, moves vs. par, cost per level, avg latency.
+- [ ] Support curtain locks, generators, inner walls, elevators, keys/locks, bombs.
+- [ ] Metrics: levels solved, moves vs. par, cost per level, avg latency (solver baseline in `docs/results.md`).
 
 ## Open questions
 
-- Does Frida work under the emulator's ARM translation? (answered in M0)
-- Exact level file format and whether it is encrypted.
-- Best move granularity for Jev (block + direction vs. block + target cell).
+- Do the engine's rules (door ice, exit conditions, layered blocks) match the game exactly? Needs
+  on-device checks.
+- Is level 7 solvable under the real rules? The solver hits a 3M node limit.
+- Best move granularity for Jev: currently block + direction (+ door for exits). Working well with the mock.
 
 ## Requirements from the owner
 
+- Accept the game's Terms of Service once in the emulator.
 - TypeSafe early-access API key.
-- Android Studio installed on the PC.

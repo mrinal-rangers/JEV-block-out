@@ -8,55 +8,110 @@ System One decision model — with a live, watchable simulation of it solving le
 - 🧠 Model: [Jev by TypeSafe AI](https://typesafe.ai/blog/introducing-system-one-models-and-jev) · [Docs](https://docs.typesafe.ai/introduction)
 - 📋 Plan & milestones: [AGENDA.md](./AGENDA.md)
 - ✅ Progress tracker: [CHECKPOINTS.md](./CHECKPOINTS.md)
+- 📊 Results: [docs/results.md](./docs/results.md)
 
-> **We do not rebuild the game.** We run the real game in an Android emulator and mod it
-> *just enough* to read the board state and play moves. Jev makes every move decision.
+> **We do not rebuild the game.** The real game runs unmodified in an Android emulator. We read
+> its level data, track the board with our own rules engine, and play moves with adb.
+> Jev makes every move decision.
 
-## How it works
+![Live viewer](./docs/viewer.png)
+
+## How it works (Path B+)
 
 ```mermaid
 flowchart LR
+    APK[("Your game APK")] -- "tools/extract_levels.py" --> LV["levels/*.txt<br/>(LevelModel JSON)"]
+    subgraph PC["PC"]
+        CORE["core<br/>parser · rules engine · solver"]
+        BRIDGE["bridge<br/>runner · confidence routing · JSONL log"]
+        VIEW["Live viewer<br/>(SSE, browser)"]
+    end
     subgraph EMU["Android emulator"]
         GAME["Block Out! (real game)"]
-        HOOK["State reader<br/>Frida hook OR screen parser"]
-        GAME <--> HOOK
-    end
-    subgraph PC["PC"]
-        BRIDGE["Bridge (Node/TS)<br/>legal moves + state JSON"]
-        DASH["Live dashboard<br/>probabilities, confidence, latency"]
     end
     JEV[("Jev API<br/>TypeSafe")]
-    HOOK -- "board state" --> BRIDGE
-    BRIDGE -- "state + Choice/Score/Noul questions" --> JEV
-    JEV -- "typed decision + probabilities" --> BRIDGE
-    BRIDGE -- "move (call or adb swipe)" --> HOOK
-    BRIDGE --> DASH
+    LV --> CORE --> BRIDGE
+    BRIDGE -- "state + Choice / Score / Noul" --> JEV
+    JEV -- "choice + probabilities" --> BRIDGE
+    BRIDGE -- "adb drag" --> GAME
+    GAME -- "screenshots (settle / verify)" --> BRIDGE
+    BRIDGE --> VIEW
 ```
 
-1. **Read state** from the running game.
-   - **Path A (preferred):** a Frida gadget injected into the APK uses the game's own
-     IL2CPP classes (`BoardSnapshot`, `BlockModel`, `CellModel`, `BoardOccupancy`, `CanMove`,
-     `CanBlockPassDoor`, …) to export the exact board as JSON.
-   - **Path B (fallback, no mod):** level layouts come from the game's cached level files;
-     live board is parsed from `adb` screenshots with OpenCV; moves are `adb` swipes.
-2. **Decide with Jev.** The bridge lists legal moves and asks Jev a `Choice`
-   ("which move?", ≤255 options) plus `Score`/`Noul` questions ("how close to solved?",
-   "is this a dead end?"). Code — not the model — enforces legality.
-3. **Act.** The chosen move is executed in the game.
-4. **Watch.** Emulator screen (scrcpy) side-by-side with a web dashboard streaming
-   each decision, its probability distribution, confidence and latency.
+1. **State.** The exact starting board comes from the level JSON shipped inside the APK
+   ([docs/game-internals.md](./docs/game-internals.md)). After each move our deterministic engine
+   computes the next state. Frida hooking was tried and does not work under ARM translation
+   ([docs/state-path.md](./docs/state-path.md)).
+2. **Decide with Jev.** Each turn the bridge asks Jev three typed questions:
+   - `next_move` — **Choice** over the legal moves (≤255), each described in plain English;
+   - `progress` — **Score** 0–4, how close to solved;
+   - `dead_end` — **Noul**, probability the position is lost.
+
+   Code — not the model — enforces legality. Low confidence (< 0.35) triggers a re-ask with the top
+   5 options, then a solver fallback.
+3. **Act.** In device mode the move is sent as an adb touch drag; the runner waits until two
+   consecutive screenshots match before the next turn.
+4. **Watch.** The browser viewer animates every move with the probability of each option,
+   confidence, progress, P(dead end), latency and which routing step chose the move.
+
+Deciders: `jev` (needs key), `mock` (offline stand-in: one-ply lookahead softmax), `solver`
+(weighted A*, plays the optimal plan). `auto` = jev if `TYPESAFE_API_KEY` is set, else mock.
+
+## Quick start
+
+Requires Node ≥ 22.18 (runs TypeScript directly, no build step).
+
+```powershell
+npm install
+npm test                       # 28 tests
+npm run bridge                 # live viewer → http://127.0.0.1:5173/?level=demo
+npm run play -- demo           # same run in the terminal
+```
+
+The bundled `examples/demo-level.json` is a synthetic level, so everything above works without the
+game. To use real levels, extract them from **your own** copy of the APK (never committed):
+
+```powershell
+pip install UnityPy
+npm run levels -- path\to\block-out.xapk      # → ./levels (gitignored)
+npm run solve -- 1 60                         # offline solver over levels 1–60
+npm run play -- 12 --decider jev              # Jev plays level 12 in simulation
+```
+
+Settings are environment variables — see [.env.example](./.env.example).
+
+### Playing on the emulator
+
+```powershell
+emulator -avd blockout -no-snapshot -no-audio -gpu swiftshader_indirect -no-boot-anim `
+  -memory 4096 -cores 4 -feature "-Vulkan,GLESDynamicVersion"
+npm run play -- 1 --device                    # or tick "device" in the viewer
+```
+
+Open the level in the game first; the bridge then drives it with adb. Screen calibration is guessed
+per board size and can be overridden in `calibration.json`.
+
+## Repo layout
+
+| Path | What |
+| - | - |
+| `packages/core` | `GameState` types, level parser, rules engine, solver, ASCII renderer |
+| `packages/bridge` | Jev / mock / solver deciders, routing agent, runner, adb device, HTTP/SSE server, CLI, viewer (`public/`) |
+| `schema/` | `game-state.schema.json` |
+| `examples/` | synthetic demo level + example state |
+| `tools/extract_levels.py` | pulls level TextAssets out of your APK |
+| `docs/` | game internals, state-path decision, results |
 
 ## Tech stack
 
 | Layer | Choice |
 | - | - |
-| Game runtime | Android Studio emulator (Android 13, x86_64 Google APIs image, ARM translation) |
-| Mod / state access | Frida gadget + [frida-il2cpp-bridge](https://github.com/vfsfitvnm/frida-il2cpp-bridge) (Path A); adb + OpenCV (Path B) |
-| Bridge | Node.js + TypeScript, Fastify, WebSocket/SSE |
-| Decision model | Jev via the TypeSafe TypeScript SDK |
-| Dashboard | Vite + React |
-| Mirroring | scrcpy |
-| Tests / CI | Vitest, GitHub Actions |
+| Game runtime | Android emulator, API 30 x86_64 Google APIs image (ARM translation) |
+| State | Level JSON from APK (UnityPy) + own rules engine; adb screenshots for settle/verify |
+| Bridge | Node.js + TypeScript (native type stripping), `node:http` + SSE |
+| Decision model | Jev via `@typesafe-ai/sdk` |
+| Viewer | Single-file HTML + canvas |
+| Tests | Vitest |
 
 ## Jev authentication & cost
 
@@ -68,10 +123,11 @@ flowchart LR
 
 ## Legal / repo hygiene
 
-This is a personal research project. **No APKs, patched APKs, or game assets are committed
-to this repository** — only scripts, patch instructions, and our own code. Use a copy of the
-game you obtained yourself.
+This is a personal research project. **No APKs, game assets or level files are committed** — only
+scripts and our own code. The demo level and test fixtures are synthetic. Use a copy of the game you
+obtained yourself.
 
 ## Status
 
-🚧 Planning — see [CHECKPOINTS.md](./CHECKPOINTS.md) for live progress and [AGENDA.md](./AGENDA.md) for the plan.
+M0–M3 built: everything runs in simulation, Jev integration is wired up and tested with a mock.
+Waiting on the TypeSafe API key and on-device verification — see [CHECKPOINTS.md](./CHECKPOINTS.md).

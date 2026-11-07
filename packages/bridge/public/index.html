@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Jev × Block Out! — live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%237c9cff'/%3E%3C/svg%3E" />
+<style>
+  :root { --bg:#0f1117; --panel:#171a23; --line:#2a2f3d; --text:#e6e8ee; --muted:#8b93a7; --accent:#7c9cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui, Segoe UI, sans-serif; background:var(--bg); color:var(--text); display:grid; grid-template-columns: minmax(360px, 1fr) 420px; height:100vh; }
+  main { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:16px; gap:10px; }
+  canvas { background:#0b0d12; border-radius:14px; max-width:100%; max-height:80vh; }
+  aside { background:var(--panel); border-left:1px solid var(--line); padding:14px; overflow:auto; display:flex; flex-direction:column; gap:12px; }
+  h1 { font-size:20px; margin:0; } h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 6px; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  input, select, button { background:#0f1117; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 9px; font:inherit; }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#0b0d12; border:none; font-weight:600; }
+  .stat { display:grid; grid-template-columns: repeat(3, 1fr); gap:6px; }
+  .stat div { background:#0f1117; border:1px solid var(--line); border-radius:8px; padding:6px 8px; }
+  .stat b { display:block; font-size:20px; } .stat span { color:var(--muted); font-size:12px; }
+  .opt { display:grid; grid-template-columns: 1fr 52px; gap:6px; align-items:center; margin:3px 0; font-size:12px; }
+  .bar { position:relative; background:#0f1117; border:1px solid var(--line); border-radius:6px; padding:3px 6px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .bar i { position:absolute; inset:0 auto 0 0; background:#2b3a6b; z-index:0; } .bar em { position:relative; font-style:normal; z-index:1; }
+  .opt.chosen .bar { border-color:var(--accent); } .opt.chosen .bar i { background:#3d5bd1; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:99px; font-size:12px; border:1px solid var(--line); }
+  .route-confident { color:#8ff0a4; } .route-reask { color:#f5d76e; } .route-solver-fallback { color:#ff9f7a; } .route-forced { color:var(--muted); }
+  #log { font:12px ui-monospace, Consolas, monospace; white-space:pre-wrap; color:var(--muted); max-height:240px; overflow:auto; }
+  #banner { font-size:20px; font-weight:600; min-height:24px; }
+  .muted { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <div id="banner"></div>
+  <canvas id="board" width="720" height="720"></canvas>
+  <div class="muted" id="caption">Pick a level and press Run.</div>
+</main>
+<aside>
+  <h1>Jev × Block Out! <span class="muted">live solver</span></h1>
+  <div>
+    <h2>Run</h2>
+    <div class="row">
+      <input id="level" value="demo" size="6" title="level number or 'demo'" />
+      <select id="decider">
+        <option value="">auto (jev if key set, else mock)</option>
+        <option value="jev">jev</option><option value="mock">mock</option><option value="solver">solver</option>
+      </select>
+      <input id="delay" type="number" value="700" min="0" step="100" style="width:80px" title="ms between moves" />
+      <label class="muted"><input id="device" type="checkbox" /> device</label>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button class="primary" id="run">Run</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="step">Step</button><button id="stop">Stop</button>
+    </div>
+  </div>
+  <div class="stat">
+    <div><b id="s-turn">–</b><span>turn</span></div>
+    <div><b id="s-left">–</b><span>blocks left</span></div>
+    <div><b id="s-conf">–</b><span>confidence</span></div>
+    <div><b id="s-prog">–</b><span>progress (0–4)</span></div>
+    <div><b id="s-dead">–</b><span>P(dead end)</span></div>
+    <div><b id="s-lat">–</b><span>latency</span></div>
+  </div>
+  <div>
+    <h2>Decider options <span id="route" class="badge"></span></h2>
+    <div id="chosen" class="muted"></div>
+    <div id="opts"></div>
+  </div>
+  <div><h2>Log</h2><div id="log"></div></div>
+</aside>
+<script>
+const COLORS = { red:"#e74c3c", blue:"#3498db", yellow:"#f1c40f", green:"#2ecc71", purple:"#9b59b6", orange:"#e67e22",
+  pink:"#ff7eb6", darkblue:"#2c3e94", turquoise:"#1abc9c", darkgreen:"#1e7d44", white:"#ecf0f1", black:"#2d2d2d" };
+const $ = (id) => document.getElementById(id);
+const cv = $("board"), cx = cv.getContext("2d");
+let state = null, anim = null, queue = [], busy = false;
+
+function geom(s) {
+  const b = s.board, cols = b.maxX - b.minX + 1, rows = b.maxY - b.minY + 1;
+  const cell = Math.floor(Math.min(cv.width / cols, cv.height / rows));
+  const ox = (cv.width - cols * cell) / 2, oy = (cv.height - rows * cell) / 2;
+  return { cell, px: (x) => ox + (x - b.minX) * cell, py: (y) => oy + (b.maxY - y) * cell };
+}
+function rr(x, y, w, h, r) { cx.beginPath(); cx.roundRect(x, y, w, h, r); }
+function draw(s, moving) {
+  cx.clearRect(0, 0, cv.width, cv.height);
+  if (!s) return;
+  const g = geom(s), c = g.cell, pad = c * 0.06;
+  for (const f of s.board.floor) { cx.fillStyle = "#1d2230"; rr(g.px(f.x) + 1, g.py(f.y) + 1, c - 2, c - 2, c * .12); cx.fill(); }
+  for (const w of s.board.walls) { cx.fillStyle = "#3a4152"; rr(g.px(w.x) + 2, g.py(w.y) + 2, c - 4, c - 4, c * .1); cx.fill(); }
+  for (const d of s.doors) for (const p of d.cells) {
+    cx.fillStyle = COLORS[d.color]; cx.globalAlpha = d.ice ? 0.35 : 1;
+    rr(g.px(p.x) + c * .15, g.py(p.y) + c * .15, c * .7, c * .7, c * .2); cx.fill(); cx.globalAlpha = 1;
+    if (d.ice) { cx.fillStyle = "#cfefff"; cx.font = `bold ${c * .38}px system-ui`; cx.textAlign = "center"; cx.textBaseline = "middle"; cx.fillText("❄" + d.ice, g.px(p.x) + c / 2, g.py(p.y) + c / 2); }
+  }
+  for (const b of s.blocks) {
+    const off = moving && moving.id === b.id ? moving.off : { x: 0, y: 0 };
+    const alpha = moving && moving.id === b.id ? moving.alpha : 1;
+    cx.globalAlpha = alpha;
+    for (const p of b.cells) {
+      const x = g.px(p.x + off.x), y = g.py(p.y + off.y);
+      cx.fillStyle = COLORS[b.color]; rr(x + pad, y + pad, c - 2 * pad, c - 2 * pad, c * .18); cx.fill();
+      if (b.layers.length) { cx.strokeStyle = COLORS[b.layers[0]]; cx.lineWidth = c * .1; rr(x + c * .25, y + c * .25, c * .5, c * .5, c * .1); cx.stroke(); }
+      if (b.ice) { cx.fillStyle = "rgba(200,235,255,.55)"; rr(x + pad, y + pad, c - 2 * pad, c - 2 * pad, c * .18); cx.fill(); }
+    }
+    const p0 = b.cells[0], x0 = g.px(p0.x + off.x) + c / 2, y0 = g.py(p0.y + off.y) + c / 2;
+    cx.fillStyle = b.color === "white" || b.color === "yellow" ? "#222" : "#fff"; cx.font = `600 ${c * .26}px system-ui`; cx.textAlign = "center"; cx.textBaseline = "middle";
+    cx.fillText(b.ice ? "❄" + b.ice : b.axis === "horizontal" ? "↔" : b.axis === "vertical" ? "↕" : "", x0, y0);
+    cx.globalAlpha = 1;
+  }
+}
+function animateMove(before, move, ms) {
+  return new Promise((done) => {
+    const pts = [{ x: 0, y: 0 }, ...move.path], segs = pts.length - 1;
+    if (segs < 1 || ms < 30) return done();
+    const t0 = performance.now();
+    const tick = (t) => {
+      const k = Math.max(0, Math.min(1, (t - t0) / ms)), f = k * segs, i = Math.min(segs - 1, Math.floor(f)), r = f - i;
+      const a = pts[i], b = pts[i + 1];
+      const exitTail = move.kind === "exit" ? Math.max(0, (f - (segs - 2)) / 2) : 0;
+      draw(before, { id: move.blockId, off: { x: a.x + (b.x - a.x) * r, y: a.y + (b.y - a.y) * r }, alpha: 1 - exitTail * .9 });
+      k < 1 ? requestAnimationFrame(tick) : done();
+    };
+    requestAnimationFrame(tick);
+  });
+}
+const pct = (v) => v == null ? "–" : (v * 100).toFixed(0) + "%";
+function showTurn(e) {
+  const d = e.decisions.at(-1);
+  $("s-turn").textContent = e.n; $("s-left").textContent = e.after.blocks.length;
+  $("s-conf").textContent = d ? pct(d.confidence) : "forced";
+  $("s-prog").textContent = d?.progress == null ? "–" : d.progress.toFixed(2);
+  $("s-dead").textContent = pct(d?.deadEnd); $("s-lat").textContent = d ? d.latencyMs + "ms" : "–";
+  $("route").textContent = e.route; $("route").className = "badge route-" + e.route;
+  $("chosen").textContent = "→ " + e.description;
+  const probs = d ? d.probabilities : { [e.moveId]: 1 };
+  const top = Object.entries(probs).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  $("opts").innerHTML = top.map(([id, p]) => `<div class="opt ${id === e.moveId ? "chosen" : ""}"><div class="bar" title="${id}"><i style="width:${(p * 100).toFixed(1)}%"></i><em>${(e.options[id] || id).replace(/</g, "&lt;")}</em></div><span>${pct(p)}</span></div>`).join("")
+    + (Object.keys(e.options).length > top.length ? `<div class="muted">… ${Object.keys(e.options).length - top.length} more legal options</div>` : "");
+}
+function log(line) { const el = $("log"); el.textContent += line + "\n"; el.scrollTop = el.scrollHeight; }
+async function pump() {
+  if (busy) return; busy = true;
+  while (queue.length) {
+    const e = queue.shift();
+    if (e.type === "start") {
+      state = e.state; $("log").textContent = ""; $("banner").textContent = ""; $("opts").innerHTML = "";
+      $("caption").textContent = `Level ${e.level} · decider: ${e.decider} · ${e.mode}`;
+      log(`▶ level ${e.level} (${e.state.blocks.length} blocks, ${e.state.doors.length} doors) with ${e.decider}`);
+      draw(state);
+    } else if (e.type === "turn") {
+      showTurn(e);
+      log(`${String(e.n).padStart(3)}. [${e.route}${e.decisions.length ? " " + pct(e.decisions.at(-1).confidence) : ""}] ${e.description}`);
+      await animateMove(e.before, e.move, Math.min(600, +$("delay").value || 0));
+      state = e.after; draw(state);
+    } else if (e.type === "end") {
+      state = e.state; draw(state);
+      $("banner").textContent = e.status === "won" ? `✅ Solved in ${e.turns} moves (${(e.ms / 1000).toFixed(1)}s)` : `⏹ ${e.status}${e.reason ? " — " + e.reason.split("\n")[0] : ""}`;
+      log(`■ ${e.status} after ${e.turns} moves`);
+    } else if (e.type === "error") { log("⚠ " + e.message); }
+  }
+  busy = false;
+}
+const es = new EventSource("/events");
+es.onmessage = (m) => { queue.push(JSON.parse(m.data)); pump(); };
+const post = (p, b) => fetch(p, { method: "POST", headers: { "content-type": "application/json" }, body: b ? JSON.stringify(b) : undefined })
+  .then((r) => r.json()).then((j) => j.error && log("⚠ " + j.error));
+$("run").onclick = () => post("/run", { level: $("level").value.trim() || "demo", decider: $("decider").value || undefined, delayMs: +$("delay").value, device: $("device").checked });
+$("pause").onclick = () => post("/pause"); $("resume").onclick = () => post("/resume"); $("step").onclick = () => post("/step"); $("stop").onclick = () => post("/stop");
+const q = new URLSearchParams(location.search); if (q.get("level")) $("level").value = q.get("level"); if (q.get("autorun")) $("run").click();
+</script>
+</body>
+</html>

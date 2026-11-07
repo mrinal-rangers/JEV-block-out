@@ -1,0 +1,13 @@
+{
+  "name": "@jev-block-out/bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@jev-block-out/core": "*",
+    "@typesafe-ai/sdk": "^0.7.0"
+  }
+}

@@ -6,6 +6,12 @@
 *.dat
 apk/
 dump/
+# Level files extracted from your own APK (game content) — never commit
+levels/
+# Runtime output
+logs/
+shots/
+calibration.json
 
 # Secrets
 .env

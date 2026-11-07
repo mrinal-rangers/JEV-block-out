@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mrinal-rangers/JEV-block-out/schema/game-state.schema.json",
+  "title": "GameState",
+  "description": "Block Out! board state as produced by @jev-block-out/core parseLevel(). Mirrors packages/core/src/types.ts. Board y grows upward (Unity convention).",
+  "type": "object",
+  "required": ["levelId", "board", "blocks", "doors", "exited", "moveCount", "status", "unsupported"],
+  "additionalProperties": false,
+  "properties": {
+    "levelId": { "type": "string" },
+    "levelIndex": { "type": "integer", "minimum": 1 },
+    "board": {
+      "type": "object",
+      "required": ["floor", "walls", "minX", "minY", "maxX", "maxY"],
+      "additionalProperties": false,
+      "properties": {
+        "floor": { "type": "array", "items": { "$ref": "#/$defs/cell" }, "description": "Playable floor cells." },
+        "walls": { "type": "array", "items": { "$ref": "#/$defs/cell" } },
+        "minX": { "type": "integer" },
+        "minY": { "type": "integer" },
+        "maxX": { "type": "integer" },
+        "maxY": { "type": "integer" }
+      }
+    },
+    "blocks": { "type": "array", "items": { "$ref": "#/$defs/block" } },
+    "doors": { "type": "array", "items": { "$ref": "#/$defs/door" } },
+    "exited": { "type": "array", "items": { "type": "string" }, "description": "Ids of blocks that have left the board, in order." },
+    "moveCount": { "type": "integer", "minimum": 0 },
+    "status": { "enum": ["playing", "won", "stuck"] },
+    "unsupported": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Level mechanics present in the source file that the engine does not model yet (e.g. \"curtain locks\", \"generators\")."
+    }
+  },
+  "$defs": {
+    "cell": {
+      "type": "object",
+      "required": ["x", "y"],
+      "additionalProperties": false,
+      "properties": { "x": { "type": "integer" }, "y": { "type": "integer" } }
+    },
+    "color": {
+      "enum": ["red", "blue", "yellow", "green", "purple", "orange", "pink", "darkblue", "turquoise", "darkgreen", "white", "black"],
+      "description": "BlockColorType 0-11 in game order."
+    },
+    "dir": { "enum": ["up", "down", "left", "right"] },
+    "block": {
+      "type": "object",
+      "required": ["id", "color", "cells", "axis", "ice", "layers"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^b[0-9]+$" },
+        "color": { "$ref": "#/$defs/color" },
+        "cells": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/cell" }, "description": "Absolute board cells currently covered." },
+        "axis": { "enum": ["both", "horizontal", "vertical"] },
+        "ice": { "type": "integer", "minimum": 0, "description": "Frozen while > 0; drops by one every time any block exits." },
+        "layers": { "type": "array", "items": { "$ref": "#/$defs/color" }, "description": "Inner layer colours revealed after the outer layer exits (outer to inner)." }
+      }
+    },
+    "door": {
+      "type": "object",
+      "required": ["id", "color", "cells", "side", "ice", "boardId"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^d[0-9]+$" },
+        "color": { "$ref": "#/$defs/color" },
+        "cells": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/cell" } },
+        "side": { "$ref": "#/$defs/dir", "description": "Board edge the door sits on; blocks exit by moving toward it." },
+        "ice": { "type": "integer", "minimum": 0, "description": "Closed while > 0; drops by one every time any block exits." },
+        "boardId": { "type": "integer" }
+      }
+    },
+    "move": {
+      "description": "A legal move as returned by legalMoves(). Ids look like exit:b2:d1:0:-1 or slide:b5:0:-1.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "blockId", "dx", "dy", "path"],
+          "properties": {
+            "kind": { "const": "slide" },
+            "blockId": { "type": "string" },
+            "dx": { "type": "integer" },
+            "dy": { "type": "integer" },
+            "path": { "type": "array", "items": { "$ref": "#/$defs/cell" } }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "blockId", "doorId", "dx", "dy", "path"],
+          "properties": {
+            "kind": { "const": "exit" },
+            "blockId": { "type": "string" },
+            "doorId": { "type": "string" },
+            "dx": { "type": "integer" },
+            "dy": { "type": "integer" },
+            "path": { "type": "array", "items": { "$ref": "#/$defs/cell" } }
+          }
+        }
+      ]
+    }
+  }
+}
