@@ -1,0 +1,25 @@
+# Game binaries & extracted assets — never commit
+*.apk
+*.xapk
+*.apks
+*.so
+*.dat
+apk/
+dump/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Node / build
+node_modules/
+dist/
+.vite/
+coverage/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
