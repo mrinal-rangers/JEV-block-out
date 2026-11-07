@@ -21,6 +21,8 @@ Android emulator — without rebuilding the game.
 
 ## Milestones
 
+> Status of each step is tracked in [CHECKPOINTS.md](./CHECKPOINTS.md).
+
 ### M0 — Environment spike (go/no-go)
 - [ ] Install Android Studio + SDK platform-tools; create Android 13 x86_64 *Google APIs* AVD (rootable).
 - [ ] `adb install-multiple` base + `config.armeabi_v7a` splits; confirm game runs under ARM translation.

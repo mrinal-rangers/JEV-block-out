@@ -7,6 +7,7 @@ System One decision model — with a live, watchable simulation of it solving le
 - 🎮 Game: [Block Out! (com.grandgames.catblockjam) on APKPure](https://apkpure.com/block-out-color-sort-puzzle/com.grandgames.catblockjam)
 - 🧠 Model: [Jev by TypeSafe AI](https://typesafe.ai/blog/introducing-system-one-models-and-jev) · [Docs](https://docs.typesafe.ai/introduction)
 - 📋 Plan & milestones: [AGENDA.md](./AGENDA.md)
+- ✅ Progress tracker: [CHECKPOINTS.md](./CHECKPOINTS.md)
 
 > **We do not rebuild the game.** We run the real game in an Android emulator and mod it
 > *just enough* to read the board state and play moves. Jev makes every move decision.
@@ -73,4 +74,4 @@ game you obtained yourself.
 
 ## Status
 
-🚧 Planning — see [AGENDA.md](./AGENDA.md).
+🚧 Planning — see [CHECKPOINTS.md](./CHECKPOINTS.md) for live progress and [AGENDA.md](./AGENDA.md) for the plan.
