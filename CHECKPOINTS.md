@@ -3,14 +3,14 @@
 Single source of truth for progress. Update the **Status** and **Evidence** columns as each
 checkpoint is completed. Detailed rationale lives in [AGENDA.md](./AGENDA.md).
 
-**Legend:** ⬜ Not started · 🟨 In progress · ✅ Done · ⛔ Blocked · ⏭️ Skipped
+**Legend:** ⬜ Not started · 🟨 In progress · ✅ Done · ⛔ Blocked · ⏸️ Deferred · ⏭️ Skipped
 **Owner:** 👤 You (mrinal-rangers) · 🤖 Copilot
 
 ## Summary
 
 | Phase | Name | Progress |
 | - | - | - |
-| M0 | Environment spike (go/no-go) | 0 / 8 |
+| M0 | Environment spike (go/no-go) | 1 / 8 (1 deferred) |
 | M1 | Game state extraction | 0 / 5 |
 | M2 | Move execution | 0 / 4 |
 | M3 | Jev integration | 0 / 6 |
@@ -23,8 +23,8 @@ checkpoint is completed. Detailed rationale lives in [AGENDA.md](./AGENDA.md).
 
 | # | Checkpoint | Owner | Status | Done when (evidence) |
 | - | - | - | - | - |
-| 0.1 | Install Android Studio + platform-tools | 👤 | ⬜ | `adb version` prints a version |
-| 0.2 | Get TypeSafe API key; set `TYPESAFE_API_KEY` locally | 👤 | ⬜ | Key exists in env (never committed) |
+| 0.1 | Install Android SDK (cmdline-tools, platform-tools, emulator, API 33 x86_64 Google APIs image) + JDK 17 | 🤖 | ✅ | adb 1.0.41 / platform-tools 37.0.1, emulator 37.2.13, WHPX usable. Full Android Studio IDE optional. |
+| 0.2 | Get TypeSafe API key; set `TYPESAFE_API_KEY` locally | 👤 | ⏸️ | Key exists in env (never committed) — deferred, not needed until M3 |
 | 0.3 | Create Android 13 x86_64 *Google APIs* AVD (rootable) | 🤖 | ⬜ | Emulator boots; `adb root` succeeds |
 | 0.4 | Install game splits with `adb install-multiple` | 🤖 | ⬜ | Game launches under ARM translation |
 | 0.5 | Play level 1 manually via `adb shell input swipe` | 🤖 | ⬜ | Screenshot of a completed level |
@@ -89,3 +89,5 @@ checkpoint is completed. Detailed rationale lives in [AGENDA.md](./AGENDA.md).
 | Date | Checkpoint | Note |
 | - | - | - |
 | 2026-11-07 | — | Repo created; README, AGENDA, tracker added. APK inspected: Unity IL2CPP, unencrypted metadata. |
+| 2026-11-07 | 0.1 | Android SDK + JDK 17 installed to `%LOCALAPPDATA%\Android` (no admin). `ANDROID_HOME`, `JAVA_HOME`, PATH set for user. Host is a Hyper-V VM; WHPX acceleration usable. |
+| 2026-11-07 | 0.2 | Deferred — API key to be provided later (needed for M3). |
