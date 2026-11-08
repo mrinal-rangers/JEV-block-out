@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { applyLegal, evaluate, renderAscii, type GameState } from "@jev-block-out/core";
-import { DEFAULT_AGENT_CONFIG, decideTurn, type AgentConfig, type TurnResult } from "./agent.ts";
+import { DEFAULT_AGENT_CONFIG, decideTurn, stateKey, type AgentConfig, type TurnResult } from "./agent.ts";
 import type { Device } from "./device.ts";
 import type { Decider } from "./jev.ts";
 import { newRunId, RunLog } from "./log.ts";
@@ -25,8 +25,6 @@ export interface RunOptions {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const stateKey = (s: GameState) =>
-  s.blocks.map((b) => `${b.id}:${b.color}:${b.cells[0]!.x},${b.cells[0]!.y}`).join("|") + `#${s.exited.length}`;
 
 /** Drives one level to completion. The engine state is the source of truth (Path B+); the device mirrors it. */
 export class Runner {
@@ -86,7 +84,7 @@ export class Runner {
       const t1 = Date.now();
       let turn: TurnResult | null;
       try {
-        turn = await decideTurn(s, opts.decider, cfg);
+        turn = await decideTurn(s, opts.decider, cfg, seen);
       } catch (err) {
         emit({ type: "error", message: (err as Error).message });
         return end("error", (err as Error).message);

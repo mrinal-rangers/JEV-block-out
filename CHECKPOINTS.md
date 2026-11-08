@@ -73,7 +73,7 @@ x86_64 emulator.
 | 3.5 | Call log: state, options, probs, confidence, latency, tokens | 🤖 | ✅ | `logs/<runId>.jsonl`, one line per turn |
 | 3.6 | **First level solved by Jev** 🎉 | 🤖 | ⛔ | Needs `TYPESAFE_API_KEY` (0.2). Mock decider already wins the demo level end-to-end |
 | 3.7 | Free alternative decider: Gemini API (`--decider gemini`) | 🤖 | ✅ | `GeminiDecider` in `packages/bridge/src/jev.ts`: enum-constrained structured output, self-reported probs, throttle + 429 retry; 5 fake-fetch tests. Live endpoint reached (400 on dummy key) |
-| 3.8 | First level solved by Gemini | 👤🤖 | ⛔ | Needs `GEMINI_API_KEY` (free, Google login) |
+| 3.8 | First level solved by Gemini | 👤🤖 | ✅ | Demo in 7 moves, level 1 in 3. Level 12 not solved in 150 moves (solver: 34) |
 
 ## M4 — Live simulation dashboard
 
@@ -107,3 +107,4 @@ x86_64 emulator.
 | 2026-11-08 | 1.2–1.5, 2.1 | `packages/core`: schema, parser, rules engine, weighted-A* solver, tests. Solver: 24 / 28 supported levels in 1–60. |
 | 2026-11-08 | 2.2–2.4, 3.1–3.5 | `packages/bridge`: adb device control, Jev / mock / solver deciders, confidence routing, runner, JSONL logs, CLI, SSE server + live viewer (early 4.1/4.2). |
 | 2026-11-08 | 3.7 | Free alternative to Jev: `gemini` decider (Google AI Studio key, free tier). Also considered GitHub Models, OpenRouter free, Groq, Ollama. `auto` falls back jev → gemini → mock. |
+| 2026-11-08 | 3.8 | Gemini key added (user env only). `gemini-3.8-flash` returned 503, so the default is now 3.6-flash with a 3.5-flash-lite fallback, 60 s timeouts and a primary retry every 10 calls. The runner now avoids revisiting board states. Gemini solved the demo and level 1; level 12 is unsolved. |

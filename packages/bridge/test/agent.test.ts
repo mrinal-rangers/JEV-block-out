@@ -2,8 +2,8 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { legalMoves, moveId, parseLevel, type GameState } from "@jev-block-out/core";
-import { buildRequest, decideTurn, DEFAULT_AGENT_CONFIG } from "../src/agent.ts";
+import { applyMove, legalMoves, moveId, parseLevel, type GameState } from "@jev-block-out/core";
+import { buildRequest, decideTurn, DEFAULT_AGENT_CONFIG, stateKey } from "../src/agent.ts";
 import { GeminiDecider, makeDecider, MockDecider, type Decider, type Decision, type DecisionRequest } from "../src/jev.ts";
 import { Runner } from "../src/runner.ts";
 import { cellCenter, dragPath, guessCalibration } from "../src/screen.ts";
@@ -124,6 +124,22 @@ describe("Runner", () => {
   });
 });
 
+describe("revisit avoidance", () => {
+  it("does not offer moves back to a visited position unless every move would", async () => {
+    const s = demo();
+    const all = legalMoves(s);
+    const keep = all[all.length - 1]!;
+    const visited = new Set(all.filter((m) => m !== keep).map((m) => stateKey(applyMove(s, m))));
+    const d = new Scripted([0.9]);
+    const t = (await decideTurn(s, d, DEFAULT_AGENT_CONFIG, visited))!;
+    expect(t.route).toBe("forced");
+    expect(t.moveId).toBe(moveId(keep));
+    const everything = new Set(all.map((m) => stateKey(applyMove(s, m))));
+    await decideTurn(s, d, DEFAULT_AGENT_CONFIG, everything);
+    expect(Object.keys(d.calls.at(-1)!.options)).toHaveLength(all.length);
+  });
+});
+
 describe("makeDecider", () => {
   it("resolves auto / empty / env and rejects unknown kinds", () => {
     const saved = { key: process.env.TYPESAFE_API_KEY, kind: process.env.JEV_DECIDER, gem: process.env.GEMINI_API_KEY };
@@ -202,7 +218,7 @@ describe("GeminiDecider", () => {
     const waits: number[] = [];
     let n = 0;
     const d = new GeminiDecider({
-      apiKey: "k", minIntervalMs: 0, sleep: async (ms) => { waits.push(ms); },
+      apiKey: "k", fallbackModels: [], minIntervalMs: 0, sleep: async (ms) => { waits.push(ms); },
       fetch: (async () => (++n === 1
         ? json(429, { error: { code: 429, message: "Resource exhausted", details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "7s" }] } })
         : answer({ next_move: ids[0], top_moves: [{ move: ids[0], probability: 0.9 }], progress: 1, dead_end: 0 }))) as typeof fetch,
@@ -216,10 +232,51 @@ describe("GeminiDecider", () => {
     const req = buildRequest(demo(), legalMoves(demo()));
     let n = 0;
     const bad = new GeminiDecider({ apiKey: "k", minIntervalMs: 0, sleep: noSleep, fetch: (async () => { n++; return json(400, { error: { message: "API key not valid" } }); }) as typeof fetch });
-    await expect(bad.decide(req)).rejects.toThrow(/400: API key not valid/);
-    const daily = new GeminiDecider({ apiKey: "k", minIntervalMs: 0, sleep: noSleep, fetch: (async () => { n++; return json(429, { error: { message: "Quota exceeded for metric: generate_content_free_tier_requests, limit: 20 per day" } }); }) as typeof fetch });
+    await expect(bad.decide(req)).rejects.toThrow(/400 \(gemini-3.6-flash\): API key not valid/);
+    const daily = new GeminiDecider({ apiKey: "k", fallbackModels: [], minIntervalMs: 0, sleep: noSleep, fetch: (async () => { n++; return json(429, { error: { message: "Quota exceeded for metric: generate_content_free_tier_requests, limit: 20 per day" } }); }) as typeof fetch });
     await expect(daily.decide(req)).rejects.toThrow(/429/);
     expect(n).toBe(2);
+  });
+
+  it("falls back to the next model on 503 / network errors, stays on it, then retries the primary", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    const urls: string[] = [];
+    const waits: number[] = [];
+    let netErr = true;
+    const d = new GeminiDecider({
+      apiKey: "k", model: "primary", fallbackModels: ["backup"], minIntervalMs: 0, sleep: async (ms) => { waits.push(ms); },
+      fetch: (async (url: string) => {
+        urls.push(url);
+        if (url.includes("/primary:")) return json(503, { error: { code: 503, message: "high demand" } });
+        if (netErr) { netErr = false; throw new TypeError("fetch failed"); }
+        return answer({ next_move: ids[0], top_moves: [{ move: ids[0], probability: 0.8 }], progress: 1, dead_end: 0 });
+      }) as typeof fetch,
+    });
+    const dec = await d.decide(req);
+    expect(dec.choice).toBe(ids[0]);
+    expect(urls.map((u) => u.match(/models\/(\w+):/)![1])).toEqual(["primary", "backup", "primary", "backup"]);
+    expect(waits.length).toBeGreaterThan(0);
+    urls.length = 0;
+    await d.decide(req);
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("/backup:");
+    for (let i = 0; i < 9; i++) await d.decide(req);
+    expect(urls.every((u) => u.includes("/backup:"))).toBe(true);
+    urls.length = 0;
+    await d.decide(req);
+    expect(urls.map((u) => u.match(/models\/(\w+):/)![1])).toEqual(["primary", "backup"]);
+  });
+
+  it("drops a model whose daily quota is spent and gives up when none are left", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const urls: string[] = [];
+    const d = new GeminiDecider({
+      apiKey: "k", model: "a", fallbackModels: ["b"], minIntervalMs: 0, sleep: async () => {},
+      fetch: (async (url: string) => { urls.push(url); return json(429, { error: { message: "Quota exceeded ... per day" } }); }) as typeof fetch,
+    });
+    await expect(d.decide(req)).rejects.toThrow(/429 \(b\)/);
+    expect(urls).toHaveLength(2);
   });
 
   it("throttles consecutive requests to the configured interval", async () => {

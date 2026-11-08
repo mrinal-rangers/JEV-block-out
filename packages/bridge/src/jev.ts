@@ -86,13 +86,18 @@ export class JevDecider implements Decider {
   }
 }
 
-export const GEMINI_DEFAULT_MODEL = "gemini-3.8-flash";
+export const GEMINI_DEFAULT_MODEL = "gemini-3.6-flash";
+export const GEMINI_DEFAULT_FALLBACKS = ["gemini-3.5-flash-lite"];
 
 export interface GeminiOptions {
   apiKey?: string;
   model?: string;
+  /** Tried in order when the current model is overloaded (503), rate-limited, times out or hits its daily quota. */
+  fallbackModels?: string[];
   /** Minimum gap between requests; default 4000 ms keeps under ~15 RPM free-tier limits. */
   minIntervalMs?: number;
+  /** Per-request timeout; default 60 s (Node's own default would hang for 300 s). */
+  timeoutMs?: number;
   maxRetries?: number;
   /** Optional thinkingLevel (minimal | low | medium | high); omitted = model default. */
   thinkingLevel?: string;
@@ -108,8 +113,12 @@ export interface GeminiOptions {
 export class GeminiDecider implements Decider {
   readonly name = "gemini";
   private readonly apiKey: string;
-  private readonly model: string;
+  /** Primary model first, then fallbacks. A working fallback stays active for 10 calls, then the primary is retried. */
+  private readonly models: string[];
+  private active = 0;
+  private callsOnFallback = 0;
   private readonly minIntervalMs: number;
+  private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly thinkingLevel: string | undefined;
   private readonly fetchFn: typeof fetch;
@@ -119,8 +128,13 @@ export class GeminiDecider implements Decider {
   constructor(opts: GeminiOptions = {}) {
     this.apiKey = opts.apiKey ?? process.env.GEMINI_API_KEY ?? "";
     if (!this.apiKey) throw new Error("gemini decider needs GEMINI_API_KEY (free key: https://aistudio.google.com/apikey)");
-    this.model = opts.model ?? (process.env.GEMINI_MODEL || GEMINI_DEFAULT_MODEL);
+    const primary = opts.model ?? (process.env.GEMINI_MODEL || GEMINI_DEFAULT_MODEL);
+    const envFallbacks = process.env.GEMINI_FALLBACK_MODELS;
+    const fallbacks = opts.fallbackModels ??
+      (envFallbacks !== undefined ? envFallbacks.split(",").map((m) => m.trim()).filter(Boolean) : GEMINI_DEFAULT_FALLBACKS);
+    this.models = [...new Set([primary, ...fallbacks])];
     this.minIntervalMs = opts.minIntervalMs ?? Number(process.env.GEMINI_MIN_INTERVAL_MS || 4000);
+    this.timeoutMs = opts.timeoutMs ?? Number(process.env.GEMINI_TIMEOUT_MS || 60_000);
     this.maxRetries = opts.maxRetries ?? 4;
     this.thinkingLevel = opts.thinkingLevel ?? (process.env.GEMINI_THINKING || undefined);
     this.fetchFn = opts.fetch ?? fetch;
@@ -139,7 +153,7 @@ export class GeminiDecider implements Decider {
         ...(this.thinkingLevel ? { thinkingConfig: { thinkingLevel: this.thinkingLevel } } : {}),
       },
     };
-    const data = await this.call(body);
+    const { data, model } = await this.call(body);
     const parts: Array<{ text?: string; thought?: boolean }> = data?.candidates?.[0]?.content?.parts ?? [];
     const text = parts.filter((p) => !p.thought && p.text).map((p) => p.text).join("");
     if (!text) throw new Error(`Gemini returned no answer (finishReason: ${data?.candidates?.[0]?.finishReason ?? "none"})`);
@@ -172,40 +186,72 @@ export class GeminiDecider implements Decider {
       deadEnd: Number.isFinite(Number(ans.dead_end)) ? clamp(Number(ans.dead_end), 0, 1) : null,
       latencyMs: Math.round(performance.now() - t0),
       tokens: { input: u.promptTokenCount ?? null, output: u.candidatesTokenCount == null ? null : out },
-      model: data?.modelVersion ?? this.model,
+      model: data?.modelVersion ?? model,
       source: "gemini",
     };
   }
 
-  /** POST generateContent with client-side throttling and retry on 429/5xx (honours the server's retryDelay). */
-  private async call(body: unknown): Promise<any> {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`;
-    for (let attempt = 0; ; attempt++) {
+  /**
+   * POST generateContent with client-side throttling, a per-request timeout and retries. On 429/5xx/timeout it
+   * first switches to a fallback model not yet tried in this call; after that it backs off (honouring retryDelay).
+   * A model whose daily quota is spent is dropped for the rest of the run.
+   */
+  private async call(body: unknown): Promise<{ data: any; model: string }> {
+    const tried = new Set<string>();
+    if (this.active !== 0 && ++this.callsOnFallback > 10) {
+      this.active = 0;
+      this.callsOnFallback = 0;
+    }
+    let lastErr = "Gemini: no models available";
+    for (let attempt = 0; attempt <= this.maxRetries + this.models.length; attempt++) {
+      if (this.models.length === 0) break;
+      this.active %= this.models.length;
+      const model = this.models[this.active]!;
+      tried.add(model);
       const wait = this.nextAt - Date.now();
       if (wait > 0) await this.sleep(wait);
       this.nextAt = Date.now() + this.minIntervalMs;
-      const res = await this.fetchFn(url, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-goog-api-key": this.apiKey },
-        body: JSON.stringify(body),
-      });
-      const raw = await res.text();
-      let data: any;
+
+      let status = 0;
+      let data: any = {};
+      let msg: string;
       try {
-        data = raw ? JSON.parse(raw) : {};
-      } catch {
-        data = {};
+        const res = await this.fetchFn(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-goog-api-key": this.apiKey },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(this.timeoutMs),
+          },
+        );
+        const raw = await res.text();
+        try {
+          data = raw ? JSON.parse(raw) : {};
+        } catch {
+          data = {};
+        }
+        if (res.ok) return { data, model };
+        status = res.status;
+        msg = data?.error?.message ?? raw.slice(0, 300);
+      } catch (err) {
+        const e = err as Error;
+        msg = e?.name === "TimeoutError" ? `timed out after ${this.timeoutMs} ms` : String(e?.message ?? err);
       }
-      if (res.ok) return data;
-      const msg: string = data?.error?.message ?? raw.slice(0, 300);
-      const retryable = res.status === 429 || res.status >= 500;
-      if (!retryable || attempt >= this.maxRetries || /per day|PerDay/i.test(msg)) {
-        throw new Error(`Gemini API ${res.status}: ${msg}`);
+      lastErr = `Gemini API ${status || "network error"} (${model}): ${msg}`;
+      if (status && status !== 429 && status < 500) throw new Error(lastErr);
+
+      if (/per day|PerDay/i.test(msg)) {
+        this.models.splice(this.active, 1);
+        continue;
       }
+      if (this.models.length > 1) this.active = (this.active + 1) % this.models.length;
+      if (!tried.has(this.models[this.active]!)) continue;
       const info = (data?.error?.details ?? []).find((d: any) => typeof d?.retryDelay === "string");
       const hinted = info ? parseFloat(info.retryDelay) * 1000 : 0;
-      await this.sleep(Math.min(60_000, Math.max(hinted, 2000 * 2 ** attempt)));
+      await this.sleep(Math.min(60_000, Math.max(hinted, 2000 * 2 ** Math.min(attempt, 5))));
     }
+    throw new Error(lastErr);
   }
 }
 

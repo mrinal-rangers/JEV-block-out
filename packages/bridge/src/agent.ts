@@ -1,8 +1,12 @@
 import {
-  COLOR_CHAR, describeMove, legalMoves, moveId, renderAscii, solve,
+  applyMove, COLOR_CHAR, describeMove, legalMoves, moveId, renderAscii, solve,
   type GameState, type Move,
 } from "@jev-block-out/core";
 import type { Decider, Decision, DecisionRequest } from "./jev.ts";
+
+/** Position identity used for loop detection (block positions/colours + how many have exited). */
+export const stateKey = (s: GameState) =>
+  s.blocks.map((b) => `${b.id}:${b.color}:${b.cells[0]!.x},${b.cells[0]!.y}`).join("|") + `#${s.exited.length}`;
 
 export interface AgentConfig {
   /** Below this, the agent re-asks Jev with only the top-k options. */
@@ -79,10 +83,21 @@ function topK(probs: Record<string, number>, k: number): string[] {
  *   else re-ask with Jev's top-k options → take it if ≥ fallbackConfidence
  *   else solver lookahead (if enabled and it finds a plan) → take the plan's first move
  *   else take Jev's best re-ask answer anyway.
+ * `avoid` holds keys of positions already visited this run: moves that lead back to one are not offered
+ * (unless every legal move does), which stops memoryless deciders from sliding a block back and forth.
  */
-export async function decideTurn(s: GameState, decider: Decider, cfg: AgentConfig = DEFAULT_AGENT_CONFIG): Promise<TurnResult | null> {
-  const moves = legalMoves(s, { limit: cfg.maxOptions });
+export async function decideTurn(
+  s: GameState,
+  decider: Decider,
+  cfg: AgentConfig = DEFAULT_AGENT_CONFIG,
+  avoid?: { has(key: string): boolean },
+): Promise<TurnResult | null> {
+  let moves = legalMoves(s, { limit: cfg.maxOptions });
   if (moves.length === 0) return null;
+  if (avoid) {
+    const fresh = moves.filter((m) => !avoid.has(stateKey(applyMove(s, m))));
+    if (fresh.length > 0) moves = fresh;
+  }
   const req = buildRequest(s, moves);
   const finish = (id: string, route: Route, decisions: Decision[]): TurnResult => {
     const move = req.moves[id];

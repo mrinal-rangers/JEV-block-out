@@ -64,7 +64,7 @@ Requires Node ≥ 22.18 (runs TypeScript directly, no build step).
 
 ```powershell
 npm install
-npm test                       # 33 tests
+npm test                       # 36 tests
 npm run bridge                 # live viewer → http://127.0.0.1:5173/?level=demo
 npm run play -- demo           # same run in the terminal
 ```
@@ -143,9 +143,18 @@ How it maps onto Jev:
 
 Limits: free-tier rate limits are per Google Cloud project and per model. Check them in
 [AI Studio](https://aistudio.google.com/rate-limit). The decider waits 4 s between calls by
-default (`GEMINI_MIN_INTERVAL_MS`) and retries 429/5xx using the server's `retryDelay`. It stops
-on a daily-quota error. Free-tier prompts may be used by Google to improve its products, which is
-fine here because only board states are sent.
+default (`GEMINI_MIN_INTERVAL_MS`) and times out a call after 60 s (`GEMINI_TIMEOUT_MS`).
+
+The default model is `gemini-3.6-flash`. When it is overloaded (503), rate-limited (429) or
+unreachable, the decider switches to `gemini-3.5-flash-lite` (`GEMINI_FALLBACK_MODELS`,
+comma-separated). After 10 calls on a fallback model it tries the primary again. A model whose
+daily quota is spent is dropped; the decider stops when no models are left. Free-tier prompts may
+be used by Google to improve its products, which is fine here because only board states are sent.
+
+Results so far (2026-11-08): Gemini solved the demo (7 moves) and level 1 (3 moves). On level 12
+it did not finish within 150 moves; the solver needs 34. The runner never lets any decider return
+to a board state it has already seen, unless every legal move would do so. This stops back-and-forth
+loops but does not make a weak model plan.
 
 Other free options: GitHub Models (free with a GitHub account), OpenRouter `:free` models, Groq,
 and local Ollama with Gemma. None of them give calibrated probabilities either, and none are wired
