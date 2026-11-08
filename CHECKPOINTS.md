@@ -9,7 +9,8 @@ checkpoint is completed. Detailed rationale lives in [AGENDA.md](./AGENDA.md).
 > **Current blockers (need 👤):**
 > 1. **Accept the game's Terms of Service** in the running emulator (tap *ACCEPT* once). This is a
 >    legal agreement, so Copilot will not click it for you. It unblocks 0.4, 0.5, 1.3 and 2.1–2.4.
-> 2. **TypeSafe API key** in `TYPESAFE_API_KEY` (0.2). Unblocks 3.6.
+> 2. **TypeSafe API key** in `TYPESAFE_API_KEY` (0.2). Unblocks 3.6. **Free stand-in:** a Gemini key from
+>    [AI Studio](https://aistudio.google.com/apikey) in `GEMINI_API_KEY` (3.7) — Google login only.
 
 ## Summary
 
@@ -18,7 +19,7 @@ checkpoint is completed. Detailed rationale lives in [AGENDA.md](./AGENDA.md).
 | M0 | Environment spike (go/no-go) | 5 / 8 (1 deferred, 1 blocked on ToS) |
 | M1 | Game state extraction | 4 / 5 (on-device check blocked on ToS) |
 | M2 | Move execution | 0 / 4 (all built and tested in sim; on-device blocked on ToS) |
-| M3 | Jev integration | 5 / 6 (first Jev solve needs API key) |
+| M3 | Jev integration | 6 / 8 (first Jev solve needs API key; first Gemini solve needs a free key) |
 | M4 | Live simulation dashboard | 0 / 4 (4.1, 4.2 partly done early) |
 | M5 | Harder mechanics & evaluation | 0 / 4 (5.3 baseline started) |
 
@@ -71,6 +72,8 @@ x86_64 emulator.
 | 3.4 | Confidence routing (low confidence → lookahead / re-ask) | 🤖 | ✅ | forced → confident (≥0.35) → re-ask top 5 → solver fallback; `packages/bridge/test/agent.test.ts` |
 | 3.5 | Call log: state, options, probs, confidence, latency, tokens | 🤖 | ✅ | `logs/<runId>.jsonl`, one line per turn |
 | 3.6 | **First level solved by Jev** 🎉 | 🤖 | ⛔ | Needs `TYPESAFE_API_KEY` (0.2). Mock decider already wins the demo level end-to-end |
+| 3.7 | Free alternative decider: Gemini API (`--decider gemini`) | 🤖 | ✅ | `GeminiDecider` in `packages/bridge/src/jev.ts`: enum-constrained structured output, self-reported probs, throttle + 429 retry; 5 fake-fetch tests. Live endpoint reached (400 on dummy key) |
+| 3.8 | First level solved by Gemini | 👤🤖 | ⛔ | Needs `GEMINI_API_KEY` (free, Google login) |
 
 ## M4 — Live simulation dashboard
 
@@ -103,3 +106,4 @@ x86_64 emulator.
 | 2026-11-07 | 0.6–0.8, 1.1 | Levels found as APK TextAssets; IL2CPP dump mapped `LevelModel`; Frida crashes translated process → Path B+. |
 | 2026-11-08 | 1.2–1.5, 2.1 | `packages/core`: schema, parser, rules engine, weighted-A* solver, tests. Solver: 24 / 28 supported levels in 1–60. |
 | 2026-11-08 | 2.2–2.4, 3.1–3.5 | `packages/bridge`: adb device control, Jev / mock / solver deciders, confidence routing, runner, JSONL logs, CLI, SSE server + live viewer (early 4.1/4.2). |
+| 2026-11-08 | 3.7 | Free alternative to Jev: `gemini` decider (Google AI Studio key, free tier). Also considered GitHub Models, OpenRouter free, Groq, Ollama. `auto` falls back jev → gemini → mock. |

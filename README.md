@@ -54,8 +54,9 @@ flowchart LR
 4. **Watch.** The browser viewer animates every move with the probability of each option,
    confidence, progress, P(dead end), latency and which routing step chose the move.
 
-Deciders: `jev` (needs key), `mock` (offline stand-in: one-ply lookahead softmax), `solver`
-(weighted A*, plays the optimal plan). `auto` = jev if `TYPESAFE_API_KEY` is set, else mock.
+Deciders: `jev` (needs key), `gemini` (free Gemini API key, see below), `mock` (offline stand-in:
+one-ply lookahead softmax), `solver` (weighted A*, plays the optimal plan). `auto` = jev if`
+`TYPESAFE_API_KEY` is set, else gemini if `GEMINI_API_KEY` is set, else mock.
 
 ## Quick start
 
@@ -63,7 +64,7 @@ Requires Node ≥ 22.18 (runs TypeScript directly, no build step).
 
 ```powershell
 npm install
-npm test                       # 28 tests
+npm test                       # 33 tests
 npm run bridge                 # live viewer → http://127.0.0.1:5173/?level=demo
 npm run play -- demo           # same run in the terminal
 ```
@@ -76,6 +77,7 @@ pip install UnityPy
 npm run levels -- path\to\block-out.xapk      # → ./levels (gitignored)
 npm run solve -- 1 60                         # offline solver over levels 1–60
 npm run play -- 12 --decider jev              # Jev plays level 12 in simulation
+npm run play -- 12 --decider gemini           # same with the free Gemini decider
 ```
 
 Settings are environment variables — see [.env.example](./.env.example).
@@ -96,7 +98,7 @@ per board size and can be overridden in `calibration.json`.
 | Path | What |
 | - | - |
 | `packages/core` | `GameState` types, level parser, rules engine, solver, ASCII renderer |
-| `packages/bridge` | Jev / mock / solver deciders, routing agent, runner, adb device, HTTP/SSE server, CLI, viewer (`public/`) |
+| `packages/bridge` | Jev / Gemini / mock / solver deciders, routing agent, runner, adb device, HTTP/SSE server, CLI, viewer (`public/`) |
 | `schema/` | `game-state.schema.json` |
 | `examples/` | synthetic demo level + example state |
 | `tools/extract_levels.py` | pulls level TextAssets out of your APK |
@@ -109,7 +111,7 @@ per board size and can be overridden in `calibration.json`.
 | Game runtime | Android emulator, API 30 x86_64 Google APIs image (ARM translation) |
 | State | Level JSON from APK (UnityPy) + own rules engine; adb screenshots for settle/verify |
 | Bridge | Node.js + TypeScript (native type stripping), `node:http` + SSE |
-| Decision model | Jev via `@typesafe-ai/sdk` |
+| Decision model | Jev via `@typesafe-ai/sdk`; free fallback: Gemini API (REST, no SDK) |
 | Viewer | Single-file HTML + canvas |
 | Tests | Vitest |
 
@@ -120,6 +122,34 @@ per board size and can be overridden in `calibration.json`.
   It is used by the PC bridge only — never embedded in the APK, never committed.
 - Pricing (published): input $0.042 / MTok, output free. At ~2k tokens/move and ~30 moves/level,
   a level costs roughly **$0.003**.
+
+## Free alternative: Gemini
+
+No Jev key yet? The `gemini` decider asks the same three questions in one Gemini API call.
+
+1. Sign in with a Google account at [Google AI Studio](https://aistudio.google.com/apikey) and
+   create an API key. The free tier needs no credit card.
+2. `setx GEMINI_API_KEY <key>` (or put it in an untracked `.env`), then open a new terminal.
+3. `npm run play -- demo --decider gemini`, or pick **gemini** in the viewer.
+
+How it maps onto Jev:
+
+| Jev question | Gemini |
+| - | - |
+| Choice `next_move` | Structured output; the answer is restricted to the legal move ids by a JSON Schema `enum` |
+| Choice probabilities | Model's own estimate for its top 5 moves, normalised. **Not calibrated** like Jev's |
+| Score `progress` | Number 0–4 on the same rubric |
+| Noul `dead_end` | Self-reported probability 0–1 |
+
+Limits: free-tier rate limits are per Google Cloud project and per model. Check them in
+[AI Studio](https://aistudio.google.com/rate-limit). The decider waits 4 s between calls by
+default (`GEMINI_MIN_INTERVAL_MS`) and retries 429/5xx using the server's `retryDelay`. It stops
+on a daily-quota error. Free-tier prompts may be used by Google to improve its products, which is
+fine here because only board states are sent.
+
+Other free options: GitHub Models (free with a GitHub account), OpenRouter `:free` models, Groq,
+and local Ollama with Gemma. None of them give calibrated probabilities either, and none are wired
+up yet.
 
 ## Legal / repo hygiene
 

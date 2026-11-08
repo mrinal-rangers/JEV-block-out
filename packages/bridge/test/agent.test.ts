@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { legalMoves, moveId, parseLevel, type GameState } from "@jev-block-out/core";
 import { buildRequest, decideTurn, DEFAULT_AGENT_CONFIG } from "../src/agent.ts";
-import { makeDecider, MockDecider, type Decider, type Decision, type DecisionRequest } from "../src/jev.ts";
+import { GeminiDecider, makeDecider, MockDecider, type Decider, type Decision, type DecisionRequest } from "../src/jev.ts";
 import { Runner } from "../src/runner.ts";
 import { cellCenter, dragPath, guessCalibration } from "../src/screen.ts";
 import { DEMO_LEVEL } from "../src/server.ts";
@@ -126,14 +126,19 @@ describe("Runner", () => {
 
 describe("makeDecider", () => {
   it("resolves auto / empty / env and rejects unknown kinds", () => {
-    const saved = { key: process.env.TYPESAFE_API_KEY, kind: process.env.JEV_DECIDER };
+    const saved = { key: process.env.TYPESAFE_API_KEY, kind: process.env.JEV_DECIDER, gem: process.env.GEMINI_API_KEY };
     try {
       delete process.env.TYPESAFE_API_KEY;
       delete process.env.JEV_DECIDER;
+      delete process.env.GEMINI_API_KEY;
       expect(makeDecider().name).toBe("mock");
       expect(makeDecider("").name).toBe("mock");
       expect(makeDecider("auto").name).toBe("mock");
       expect(makeDecider("solver").name).toBe("solver");
+      expect(() => makeDecider("gemini")).toThrow(/GEMINI_API_KEY/);
+      process.env.GEMINI_API_KEY = "test-key";
+      expect(makeDecider("auto").name).toBe("gemini");
+      expect(makeDecider("gemini").name).toBe("gemini");
       process.env.JEV_DECIDER = "solver";
       expect(makeDecider("").name).toBe("solver");
       expect(makeDecider("mock").name).toBe("mock");
@@ -142,6 +147,92 @@ describe("makeDecider", () => {
     } finally {
       if (saved.key === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = saved.key;
       if (saved.kind === undefined) delete process.env.JEV_DECIDER; else process.env.JEV_DECIDER = saved.kind;
+      if (saved.gem === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = saved.gem;
     }
+  });
+});
+
+describe("GeminiDecider", () => {
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const answer = (a: unknown, usage = { promptTokenCount: 900, candidatesTokenCount: 40, thoughtsTokenCount: 10 }) =>
+    json(200, { candidates: [{ content: { parts: [{ text: JSON.stringify(a) }] } }], usageMetadata: usage, modelVersion: "gemini-test-001" });
+  const noSleep = async () => {};
+
+  it("sends a schema-constrained request and maps the answer onto a Decision", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    const sent: Array<{ url: string; init: RequestInit }> = [];
+    const d = new GeminiDecider({
+      apiKey: "k", model: "gemini-test", minIntervalMs: 0, sleep: noSleep,
+      fetch: (async (url: string, init: RequestInit) => {
+        sent.push({ url, init });
+        return answer({ next_move: ids[1], top_moves: [{ move: ids[1], probability: 0.6 }, { move: ids[0], probability: 0.2 }, { move: "bogus", probability: 0.5 }], progress: 2.5, dead_end: 0.1 });
+      }) as typeof fetch,
+    });
+    const dec = await d.decide(req);
+    expect(sent[0]!.url).toContain("/models/gemini-test:generateContent");
+    expect((sent[0]!.init.headers as Record<string, string>)["x-goog-api-key"]).toBe("k");
+    const body = JSON.parse(String(sent[0]!.init.body));
+    expect(body.generationConfig.responseJsonSchema.properties.next_move.enum).toEqual(ids);
+    expect(body.contents[0].parts[0].text).toContain(ids[0]);
+    expect(dec.choice).toBe(ids[1]);
+    expect(dec.confidence).toBeCloseTo(0.75);
+    expect(dec.probabilities[ids[0]!]).toBeCloseTo(0.25);
+    expect(Object.keys(dec.probabilities)).toEqual(ids);
+    expect(dec).toMatchObject({ progress: 2.5, deadEnd: 0.1, model: "gemini-test-001", source: "gemini", tokens: { input: 900, output: 50 } });
+  });
+
+  it("gives the chosen move the leftover mass when the model omits it from top_moves", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    const d = new GeminiDecider({
+      apiKey: "k", minIntervalMs: 0, sleep: noSleep,
+      fetch: (async () => answer({ next_move: ids[0], top_moves: [{ move: ids[1], probability: 0.3 }], progress: 9, dead_end: -1 })) as typeof fetch,
+    });
+    const dec = await d.decide(req);
+    expect(dec.choice).toBe(ids[0]);
+    expect(dec.confidence).toBeCloseTo(0.7);
+    expect(dec.progress).toBe(4);
+    expect(dec.deadEnd).toBe(0);
+  });
+
+  it("retries 429s using the server's retryDelay, then succeeds", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    const waits: number[] = [];
+    let n = 0;
+    const d = new GeminiDecider({
+      apiKey: "k", minIntervalMs: 0, sleep: async (ms) => { waits.push(ms); },
+      fetch: (async () => (++n === 1
+        ? json(429, { error: { code: 429, message: "Resource exhausted", details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "7s" }] } })
+        : answer({ next_move: ids[0], top_moves: [{ move: ids[0], probability: 0.9 }], progress: 1, dead_end: 0 }))) as typeof fetch,
+    });
+    expect((await d.decide(req)).choice).toBe(ids[0]);
+    expect(n).toBe(2);
+    expect(waits).toContain(7000);
+  });
+
+  it("fails fast on non-retryable errors and exhausted daily quota", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    let n = 0;
+    const bad = new GeminiDecider({ apiKey: "k", minIntervalMs: 0, sleep: noSleep, fetch: (async () => { n++; return json(400, { error: { message: "API key not valid" } }); }) as typeof fetch });
+    await expect(bad.decide(req)).rejects.toThrow(/400: API key not valid/);
+    const daily = new GeminiDecider({ apiKey: "k", minIntervalMs: 0, sleep: noSleep, fetch: (async () => { n++; return json(429, { error: { message: "Quota exceeded for metric: generate_content_free_tier_requests, limit: 20 per day" } }); }) as typeof fetch });
+    await expect(daily.decide(req)).rejects.toThrow(/429/);
+    expect(n).toBe(2);
+  });
+
+  it("throttles consecutive requests to the configured interval", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    const waits: number[] = [];
+    const d = new GeminiDecider({
+      apiKey: "k", minIntervalMs: 4000, sleep: async (ms) => { waits.push(ms); },
+      fetch: (async () => answer({ next_move: ids[0], top_moves: [], progress: 0, dead_end: 0 })) as typeof fetch,
+    });
+    await d.decide(req);
+    await d.decide(req);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]!).toBeGreaterThan(3000);
   });
 });

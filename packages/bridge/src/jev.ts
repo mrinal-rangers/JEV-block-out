@@ -23,7 +23,7 @@ export interface Decision {
   latencyMs: number;
   tokens: { input: number | null; output: number | null };
   model: string;
-  source: "jev" | "mock";
+  source: "jev" | "gemini" | "mock";
 }
 
 export interface Decider {
@@ -84,6 +84,179 @@ export class JevDecider implements Decider {
       source: "jev",
     };
   }
+}
+
+export const GEMINI_DEFAULT_MODEL = "gemini-3.8-flash";
+
+export interface GeminiOptions {
+  apiKey?: string;
+  model?: string;
+  /** Minimum gap between requests; default 4000 ms keeps under ~15 RPM free-tier limits. */
+  minIntervalMs?: number;
+  maxRetries?: number;
+  /** Optional thinkingLevel (minimal | low | medium | high); omitted = model default. */
+  thinkingLevel?: string;
+  fetch?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Free alternative to Jev: Gemini API with a Google AI Studio key (free tier, no card).
+ * One structured-output call answers all three questions. The move is constrained to the legal ids via a JSON
+ * Schema enum; probabilities are the model's self-reported estimates, so they are NOT calibrated like Jev's.
+ */
+export class GeminiDecider implements Decider {
+  readonly name = "gemini";
+  private readonly apiKey: string;
+  private readonly model: string;
+  private readonly minIntervalMs: number;
+  private readonly maxRetries: number;
+  private readonly thinkingLevel: string | undefined;
+  private readonly fetchFn: typeof fetch;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private nextAt = 0;
+
+  constructor(opts: GeminiOptions = {}) {
+    this.apiKey = opts.apiKey ?? process.env.GEMINI_API_KEY ?? "";
+    if (!this.apiKey) throw new Error("gemini decider needs GEMINI_API_KEY (free key: https://aistudio.google.com/apikey)");
+    this.model = opts.model ?? (process.env.GEMINI_MODEL || GEMINI_DEFAULT_MODEL);
+    this.minIntervalMs = opts.minIntervalMs ?? Number(process.env.GEMINI_MIN_INTERVAL_MS || 4000);
+    this.maxRetries = opts.maxRetries ?? 4;
+    this.thinkingLevel = opts.thinkingLevel ?? (process.env.GEMINI_THINKING || undefined);
+    this.fetchFn = opts.fetch ?? fetch;
+    this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  }
+
+  async decide(req: DecisionRequest): Promise<Decision> {
+    const t0 = performance.now();
+    const ids = Object.keys(req.options);
+    if (ids.length === 0) throw new Error("Gemini: no legal moves to choose from");
+    const body = {
+      contents: [{ role: "user", parts: [{ text: geminiPrompt(req) }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseJsonSchema: geminiSchema(ids),
+        ...(this.thinkingLevel ? { thinkingConfig: { thinkingLevel: this.thinkingLevel } } : {}),
+      },
+    };
+    const data = await this.call(body);
+    const parts: Array<{ text?: string; thought?: boolean }> = data?.candidates?.[0]?.content?.parts ?? [];
+    const text = parts.filter((p) => !p.thought && p.text).map((p) => p.text).join("");
+    if (!text) throw new Error(`Gemini returned no answer (finishReason: ${data?.candidates?.[0]?.finishReason ?? "none"})`);
+    let ans: { next_move?: unknown; top_moves?: Array<{ move?: unknown; probability?: unknown }>; progress?: unknown; dead_end?: unknown };
+    try {
+      ans = JSON.parse(text);
+    } catch {
+      throw new Error(`Gemini returned invalid JSON: ${text.slice(0, 200)}`);
+    }
+
+    const probabilities: Record<string, number> = Object.fromEntries(ids.map((id) => [id, 0]));
+    for (const t of Array.isArray(ans.top_moves) ? ans.top_moves : []) {
+      if (typeof t?.move === "string" && Object.hasOwn(probabilities, t.move)) probabilities[t.move]! += clamp(Number(t.probability), 0, 1);
+    }
+    const ranked = ids.filter((id) => probabilities[id]! > 0).sort((a, b) => probabilities[b]! - probabilities[a]!);
+    const choice = typeof ans.next_move === "string" && Object.hasOwn(probabilities, ans.next_move) ? ans.next_move : ranked[0];
+    if (!choice) throw new Error(`Gemini picked an unknown move: ${String(ans.next_move)}`);
+    if (probabilities[choice] === 0) probabilities[choice] = Math.max(0, 1 - sum(Object.values(probabilities)));
+    const z = sum(Object.values(probabilities));
+    if (z > 0) for (const id of ids) probabilities[id]! /= z;
+    else probabilities[choice] = 1;
+
+    const u = data?.usageMetadata ?? {};
+    const out = (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0);
+    return {
+      choice,
+      probabilities,
+      confidence: probabilities[choice]!,
+      progress: Number.isFinite(Number(ans.progress)) ? clamp(Number(ans.progress), 0, 4) : null,
+      deadEnd: Number.isFinite(Number(ans.dead_end)) ? clamp(Number(ans.dead_end), 0, 1) : null,
+      latencyMs: Math.round(performance.now() - t0),
+      tokens: { input: u.promptTokenCount ?? null, output: u.candidatesTokenCount == null ? null : out },
+      model: data?.modelVersion ?? this.model,
+      source: "gemini",
+    };
+  }
+
+  /** POST generateContent with client-side throttling and retry on 429/5xx (honours the server's retryDelay). */
+  private async call(body: unknown): Promise<any> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`;
+    for (let attempt = 0; ; attempt++) {
+      const wait = this.nextAt - Date.now();
+      if (wait > 0) await this.sleep(wait);
+      this.nextAt = Date.now() + this.minIntervalMs;
+      const res = await this.fetchFn(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": this.apiKey },
+        body: JSON.stringify(body),
+      });
+      const raw = await res.text();
+      let data: any;
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        data = {};
+      }
+      if (res.ok) return data;
+      const msg: string = data?.error?.message ?? raw.slice(0, 300);
+      const retryable = res.status === 429 || res.status >= 500;
+      if (!retryable || attempt >= this.maxRetries || /per day|PerDay/i.test(msg)) {
+        throw new Error(`Gemini API ${res.status}: ${msg}`);
+      }
+      const info = (data?.error?.details ?? []).find((d: any) => typeof d?.retryDelay === "string");
+      const hinted = info ? parseFloat(info.retryDelay) * 1000 : 0;
+      await this.sleep(Math.min(60_000, Math.max(hinted, 2000 * 2 ** attempt)));
+    }
+  }
+}
+
+export function geminiPrompt(req: DecisionRequest): string {
+  const moves = Object.entries(req.options).map(([id, d]) => `- ${id}: ${d}`).join("\n");
+  const rubric = PROGRESS_RUBRIC.map((r, i) => `  ${i} = ${r}`).join("\n");
+  return [
+    NEXT_MOVE_INSTRUCTIONS,
+    "",
+    "Board (JSON):",
+    JSON.stringify(req.view),
+    "",
+    "Legal moves (id: description):",
+    moves,
+    "",
+    "Reply with JSON:",
+    "- next_move: the id of the single best move.",
+    "- top_moves: up to 5 of the most promising move ids (including next_move) with your probability (0-1) that each " +
+      "is the best move; the probabilities should sum to at most 1.",
+    `- progress: how close the position is to solved, 0-4:\n${rubric}`,
+    `- dead_end: probability (0-1) that this statement is true: "${DEAD_END_STATEMENT}"`,
+  ].join("\n");
+}
+
+export function geminiSchema(ids: string[]): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      next_move: { type: "string", enum: ids },
+      top_moves: {
+        type: "array",
+        maxItems: 5,
+        items: {
+          type: "object",
+          properties: { move: { type: "string", enum: ids }, probability: { type: "number", minimum: 0, maximum: 1 } },
+          required: ["move", "probability"],
+        },
+      },
+      progress: { type: "number", minimum: 0, maximum: 4 },
+      dead_end: { type: "number", minimum: 0, maximum: 1 },
+    },
+    required: ["next_move", "top_moves", "progress", "dead_end"],
+  };
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo;
+}
+
+function sum(xs: number[]): number {
+  return xs.reduce((a, b) => a + b, 0);
 }
 
 /**
@@ -153,15 +326,19 @@ export class SolverDecider implements Decider {
   }
 }
 
-/** kind: "jev" | "mock" | "solver" | "auto" (or empty). Auto = JEV_DECIDER, else jev when a key is set, else mock. */
+/**
+ * kind: "jev" | "gemini" | "mock" | "solver" | "auto" (or empty).
+ * Auto = JEV_DECIDER, else jev when TYPESAFE_API_KEY is set, else gemini when GEMINI_API_KEY is set, else mock.
+ */
 export function makeDecider(kind?: string): Decider {
   let k = kind && kind !== "auto" ? kind : process.env.JEV_DECIDER;
-  if (!k || k === "auto") k = process.env.TYPESAFE_API_KEY ? "jev" : "mock";
+  if (!k || k === "auto") k = process.env.TYPESAFE_API_KEY ? "jev" : process.env.GEMINI_API_KEY ? "gemini" : "mock";
   if (k === "solver") return new SolverDecider();
   if (k === "jev") {
     if (!process.env.TYPESAFE_API_KEY) throw new Error("JEV_DECIDER=jev needs TYPESAFE_API_KEY (see .env.example)");
     return new JevDecider();
   }
-  if (k !== "mock") throw new Error(`Unknown decider "${k}" (use jev, mock, solver or auto)`);
+  if (k === "gemini") return new GeminiDecider();
+  if (k !== "mock") throw new Error(`Unknown decider "${k}" (use jev, gemini, mock, solver or auto)`);
   return new MockDecider();
 }

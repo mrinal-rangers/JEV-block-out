@@ -6,7 +6,7 @@ import { loadAnyLevel, startServer } from "./server.ts";
 
 const USAGE = `jev-block-out
   solve <from> [to] [--nodes N] [--weight W]   solve extracted levels with the search solver
-  play <level|demo> [--decider auto|jev|mock|solver] [--device] [--delay ms]
+  play <level|demo> [--decider auto|jev|gemini|mock|solver] [--device] [--delay ms]
                                                 play one level in the terminal (and on the emulator with --device)
   serve [--port 5173]                           live viewer at http://127.0.0.1:5173`;
 
