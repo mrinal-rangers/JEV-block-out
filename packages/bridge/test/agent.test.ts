@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { applyMove, legalMoves, moveId, parseLevel, type GameState } from "@jev-block-out/core";
 import { buildRequest, decideTurn, DEFAULT_AGENT_CONFIG, stateKey } from "../src/agent.ts";
-import { GeminiDecider, makeDecider, MockDecider, type Decider, type Decision, type DecisionRequest } from "../src/jev.ts";
+import { GeminiDecider, makeDecider, MockDecider, type CallEvent, type Decider, type Decision, type DecisionRequest } from "../src/jev.ts";
 import { Runner } from "../src/runner.ts";
 import { cellCenter, dragPath, guessCalibration } from "../src/screen.ts";
 import { DEMO_LEVEL } from "../src/server.ts";
@@ -266,6 +266,29 @@ describe("GeminiDecider", () => {
     urls.length = 0;
     await d.decide(req);
     expect(urls.map((u) => u.match(/models\/(\w+):/)![1])).toEqual(["primary", "backup"]);
+  });
+
+  it("traces every attempt as a request/response pair without leaking the API key", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    let n = 0;
+    const d = new GeminiDecider({
+      apiKey: "secret-key", model: "m", fallbackModels: [], minIntervalMs: 0, sleep: async () => {},
+      fetch: (async () => (++n === 1 ? json(503, { error: { message: "busy" } })
+        : answer({ next_move: ids[0], top_moves: [{ move: ids[0], probability: 0.9 }], progress: 2, dead_end: 0 }))) as typeof fetch,
+    });
+    const events: CallEvent[] = [];
+    await d.decide(req, (e) => events.push(e));
+    expect(events.map((e) => `${e.phase}:${e.status ?? ""}`)).toEqual(["request:", "response:503", "request:", "response:200"]);
+    expect(events[0]!.callId).toBe(events[1]!.callId);
+    expect(events[2]!.attempt).toBe(2);
+    expect(JSON.stringify(events)).not.toContain("secret-key");
+    expect(JSON.stringify(events[0]!.payload)).toContain(ids[0]);
+
+    const mockEvents: CallEvent[] = [];
+    const t = await decideTurn(demo(), new MockDecider(0.05), { ...DEFAULT_AGENT_CONFIG, lowConfidence: 0 }, undefined, (e) => mockEvents.push(e));
+    expect(mockEvents.map((e) => `${e.phase}:${e.round}`)).toEqual(["request:first", "response:first"]);
+    expect((mockEvents[1]!.body as { next_move: string }).next_move).toBe(t!.moveId);
   });
 
   it("drops a model whose daily quota is spent and gives up when none are left", async () => {

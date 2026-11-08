@@ -3,13 +3,14 @@ import { join, resolve } from "node:path";
 import { applyLegal, evaluate, renderAscii, type GameState } from "@jev-block-out/core";
 import { DEFAULT_AGENT_CONFIG, decideTurn, stateKey, type AgentConfig, type TurnResult } from "./agent.ts";
 import type { Device } from "./device.ts";
-import type { Decider } from "./jev.ts";
+import type { CallEvent, Decider } from "./jev.ts";
 import { newRunId, RunLog } from "./log.ts";
 import { dragPath, loadCalibration } from "./screen.ts";
 
 export type RunEvent =
   | { type: "start"; runId: string; level: string; decider: string; mode: "sim" | "device"; state: GameState }
   | ({ type: "turn"; n: number; before: GameState; after: GameState; ms: number } & TurnResult)
+  | ({ type: "call"; n: number } & CallEvent)
   | { type: "end"; status: string; turns: number; ms: number; reason?: string; state: GameState }
   | { type: "error"; message: string };
 
@@ -84,7 +85,7 @@ export class Runner {
       const t1 = Date.now();
       let turn: TurnResult | null;
       try {
-        turn = await decideTurn(s, opts.decider, cfg, seen);
+        turn = await decideTurn(s, opts.decider, cfg, seen, (c) => emit({ type: "call", n, ...c }));
       } catch (err) {
         emit({ type: "error", message: (err as Error).message });
         return end("error", (err as Error).message);

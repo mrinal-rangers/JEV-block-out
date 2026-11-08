@@ -2,7 +2,7 @@ import {
   applyMove, COLOR_CHAR, describeMove, legalMoves, moveId, renderAscii, solve,
   type GameState, type Move,
 } from "@jev-block-out/core";
-import type { Decider, Decision, DecisionRequest } from "./jev.ts";
+import type { CallTracer, Decider, Decision, DecisionRequest } from "./jev.ts";
 
 /** Position identity used for loop detection (block positions/colours + how many have exited). */
 export const stateKey = (s: GameState) =>
@@ -91,7 +91,9 @@ export async function decideTurn(
   decider: Decider,
   cfg: AgentConfig = DEFAULT_AGENT_CONFIG,
   avoid?: { has(key: string): boolean },
+  trace?: CallTracer,
 ): Promise<TurnResult | null> {
+  const round = (r: string): CallTracer | undefined => (trace ? (e) => trace({ ...e, round: r }) : undefined);
   let moves = legalMoves(s, { limit: cfg.maxOptions });
   if (moves.length === 0) return null;
   if (avoid) {
@@ -107,7 +109,7 @@ export async function decideTurn(
 
   if (moves.length === 1) return finish(Object.keys(req.moves)[0]!, "forced", []);
 
-  const first = await decider.decide(req);
+  const first = await decider.decide(req, round("first"));
   const decisions = [first];
   if (!(first.choice in req.moves)) throw new Error(`Decider returned unknown option ${first.choice}`);
   if (first.confidence >= cfg.lowConfidence) return finish(first.choice, "confident", decisions);
@@ -118,7 +120,7 @@ export async function decideTurn(
     options: Object.fromEntries(shortlist.map((id) => [id, req.options[id]!])),
     moves: Object.fromEntries(shortlist.map((id) => [id, req.moves[id]!])),
   };
-  const second = await decider.decide(sub);
+  const second = await decider.decide(sub, round("reask"));
   decisions.push(second);
   const pick = second.choice in sub.moves ? second.choice : first.choice;
   if (second.confidence >= cfg.fallbackConfidence) return finish(pick, "reask", decisions);

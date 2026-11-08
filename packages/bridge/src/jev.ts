@@ -26,9 +26,52 @@ export interface Decision {
   source: "jev" | "gemini" | "mock";
 }
 
+/** One model round-trip, reported twice (request, then response) so a viewer can show calls in flight. */
+export interface CallEvent {
+  phase: "request" | "response";
+  /** Pairs a response with its request; unique per decider instance. */
+  callId: number;
+  provider: string;
+  model: string;
+  /** "first" or "reask" — filled in by the agent. */
+  round?: string;
+  attempt?: number;
+  endpoint?: string;
+  /** Exact request body (request phase). Never includes API keys. */
+  payload?: unknown;
+  /** HTTP status, or 0 for network errors/timeouts (response phase). */
+  status?: number;
+  ms?: number;
+  /** Raw response body (response phase). */
+  body?: unknown;
+  error?: string;
+}
+export type CallTracer = (e: CallEvent) => void;
+
 export interface Decider {
   readonly name: string;
-  decide(req: DecisionRequest): Promise<Decision>;
+  decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision>;
+}
+
+let nextCallId = 1;
+/** Wraps one round-trip with request/response trace events. */
+async function traced<T>(
+  trace: CallTracer | undefined,
+  base: Omit<CallEvent, "phase" | "callId">,
+  run: () => Promise<{ status: number; body: unknown; value: T }>,
+): Promise<T> {
+  const callId = nextCallId++;
+  const t0 = performance.now();
+  trace?.({ ...base, phase: "request", callId });
+  const head = { provider: base.provider, model: base.model, attempt: base.attempt, phase: "response" as const, callId };
+  try {
+    const r = await run();
+    trace?.({ ...head, status: r.status, ms: Math.round(performance.now() - t0), body: r.body });
+    return r.value;
+  } catch (err) {
+    trace?.({ ...head, status: 0, ms: Math.round(performance.now() - t0), error: (err as Error).message });
+    throw err;
+  }
 }
 
 export const NEXT_MOVE_INSTRUCTIONS =
@@ -60,17 +103,22 @@ export class JevDecider implements Decider {
     this.model = opts.model ?? process.env.JEV_MODEL;
   }
 
-  async decide(req: DecisionRequest): Promise<Decision> {
+  async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
     const t0 = performance.now();
-    const res = await this.client.systemOne({
-      state: req.view as never,
-      questions: {
-        next_move: choice(NEXT_MOVE_INSTRUCTIONS, req.options),
-        progress: score("How close is this position to being solved?", PROGRESS_RUBRIC),
-        dead_end: noul(DEAD_END_STATEMENT),
+    const questions = {
+      next_move: choice(NEXT_MOVE_INSTRUCTIONS, req.options),
+      progress: score("How close is this position to being solved?", PROGRESS_RUBRIC),
+      dead_end: noul(DEAD_END_STATEMENT),
+    };
+    const args = { state: req.view as never, questions, ...(this.model ? { model: this.model } : {}) };
+    const res = await traced(
+      trace,
+      { provider: "jev", model: this.model ?? "default", endpoint: "TypeSafe systemOne", payload: args },
+      async () => {
+        const r = await this.client.systemOne(args);
+        return { status: 200, body: r, value: r };
       },
-      ...(this.model ? { model: this.model } : {}),
-    });
+    );
     const a = res.answers;
     return {
       choice: a.next_move.choice,
@@ -141,7 +189,7 @@ export class GeminiDecider implements Decider {
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  async decide(req: DecisionRequest): Promise<Decision> {
+  async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
     const t0 = performance.now();
     const ids = Object.keys(req.options);
     if (ids.length === 0) throw new Error("Gemini: no legal moves to choose from");
@@ -153,7 +201,7 @@ export class GeminiDecider implements Decider {
         ...(this.thinkingLevel ? { thinkingConfig: { thinkingLevel: this.thinkingLevel } } : {}),
       },
     };
-    const { data, model } = await this.call(body);
+    const { data, model } = await this.call(body, trace);
     const parts: Array<{ text?: string; thought?: boolean }> = data?.candidates?.[0]?.content?.parts ?? [];
     const text = parts.filter((p) => !p.thought && p.text).map((p) => p.text).join("");
     if (!text) throw new Error(`Gemini returned no answer (finishReason: ${data?.candidates?.[0]?.finishReason ?? "none"})`);
@@ -196,7 +244,7 @@ export class GeminiDecider implements Decider {
    * first switches to a fallback model not yet tried in this call; after that it backs off (honouring retryDelay).
    * A model whose daily quota is spent is dropped for the rest of the run.
    */
-  private async call(body: unknown): Promise<{ data: any; model: string }> {
+  private async call(body: unknown, trace?: CallTracer): Promise<{ data: any; model: string }> {
     const tried = new Set<string>();
     if (this.active !== 0 && ++this.callsOnFallback > 10) {
       this.active = 0;
@@ -215,9 +263,14 @@ export class GeminiDecider implements Decider {
       let status = 0;
       let data: any = {};
       let msg: string;
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+      const callId = nextCallId++;
+      const head = { provider: "gemini", model, attempt: attempt + 1, callId };
+      trace?.({ ...head, phase: "request", endpoint, payload: body });
+      const tCall = performance.now();
       try {
         const res = await this.fetchFn(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+          endpoint,
           {
             method: "POST",
             headers: { "content-type": "application/json", "x-goog-api-key": this.apiKey },
@@ -231,12 +284,14 @@ export class GeminiDecider implements Decider {
         } catch {
           data = {};
         }
+        trace?.({ ...head, phase: "response", status: res.status, ms: Math.round(performance.now() - tCall), body: raw && !Object.keys(data).length ? raw.slice(0, 2000) : data });
         if (res.ok) return { data, model };
         status = res.status;
         msg = data?.error?.message ?? raw.slice(0, 300);
       } catch (err) {
         const e = err as Error;
         msg = e?.name === "TimeoutError" ? `timed out after ${this.timeoutMs} ms` : String(e?.message ?? err);
+        trace?.({ ...head, phase: "response", status: 0, ms: Math.round(performance.now() - tCall), error: msg });
       }
       lastErr = `Gemini API ${status || "network error"} (${model}): ${msg}`;
       if (status && status !== 429 && status < 500) throw new Error(lastErr);
@@ -316,7 +371,14 @@ export class MockDecider implements Decider {
     this.temperature = temperature;
   }
 
-  async decide(req: DecisionRequest): Promise<Decision> {
+  async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
+    return traced(trace, { provider: "mock", model: "mock-heuristic", endpoint: "local", payload: localPayload(req) }, async () => {
+      const d = this.score(req);
+      return { status: 200, body: localAnswer(d), value: d };
+    });
+  }
+
+  private score(req: DecisionRequest): Decision {
     const t0 = performance.now();
     const ids = Object.keys(req.options);
     const before = req.state.blocks.length * 3 + obstruction(req.state);
@@ -352,7 +414,14 @@ export class MockDecider implements Decider {
 /** Baseline: plays the solver's plan (confidence 1 on the planned move). Useful to compare Jev against. */
 export class SolverDecider implements Decider {
   readonly name = "solver";
-  async decide(req: DecisionRequest): Promise<Decision> {
+  async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
+    return traced(trace, { provider: "solver", model: "weighted A*", endpoint: "local", payload: localPayload(req) }, async () => {
+      const d = this.plan(req);
+      return { status: 200, body: localAnswer(d), value: d };
+    });
+  }
+
+  private plan(req: DecisionRequest): Decision {
     const t0 = performance.now();
     const plan = solve(req.state, { maxNodes: 60_000, weight: 1 });
     const ids = Object.keys(req.options);
@@ -370,6 +439,17 @@ export class SolverDecider implements Decider {
       source: "mock",
     };
   }
+}
+
+/** Request summary for local deciders (no network call). */
+function localPayload(req: DecisionRequest): Record<string, unknown> {
+  return { state: req.view, options: req.options };
+}
+
+function localAnswer(d: Decision): Record<string, unknown> {
+  const top = Object.entries(d.probabilities).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    .map(([move, p]) => ({ move, probability: Math.round(p * 1000) / 1000 }));
+  return { next_move: d.choice, top_moves: top, progress: d.progress, dead_end: d.deadEnd, model: d.model };
 }
 
 /**

@@ -14,7 +14,7 @@ System One decision model — with a live, watchable simulation of it solving le
 > its level data, track the board with our own rules engine, and play moves with adb.
 > Jev makes every move decision.
 
-![Live viewer](./docs/viewer.png)
+![Live arena: Gemini vs solver on level 1](./docs/viewer.png)
 
 ## How it works (Path B+)
 
@@ -24,7 +24,7 @@ flowchart LR
     subgraph PC["PC"]
         CORE["core<br/>parser · rules engine · solver"]
         BRIDGE["bridge<br/>runner · confidence routing · JSONL log"]
-        VIEW["Live viewer<br/>(SSE, browser)"]
+        VIEW["Live arena<br/>(SSE, browser)"]
     end
     subgraph EMU["Android emulator"]
         GAME["Block Out! (real game)"]
@@ -51,8 +51,11 @@ flowchart LR
    5 options, then a solver fallback.
 3. **Act.** In device mode the move is sent as an adb touch drag; the runner waits until two
    consecutive screenshots match before the next turn.
-4. **Watch.** The browser viewer animates every move with the probability of each option,
-   confidence, progress, P(dead end), latency and which routing step chose the move.
+4. **Watch.** The browser **live arena** runs several deciders side by side on the same level
+   (e.g. Gemini vs the solver, or Jev vs Gemini). For each lane it shows every model call as it
+   happens (the full request, the raw response, latency, tokens and errors such as 429s), the board
+   animating move by move, the probability of each option, and the move list. An optional panel
+   mirrors the emulator screen.
 
 Deciders: `jev` (needs key), `gemini` (free Gemini API key, see below), `mock` (offline stand-in:
 one-ply lookahead softmax), `solver` (weighted A*, plays the optimal plan). `auto` = jev if`
@@ -64,10 +67,29 @@ Requires Node ≥ 22.18 (runs TypeScript directly, no build step).
 
 ```powershell
 npm install
-npm test                       # 36 tests
-npm run bridge                 # live viewer → http://127.0.0.1:5173/?level=demo
+npm test                       # 37 tests
+npm run bridge                 # live arena → http://127.0.0.1:5173/?level=demo
 npm run play -- demo           # same run in the terminal
 ```
+
+### Live arena
+
+`npm run bridge`, then open <http://127.0.0.1:5173>. Pick a level (the list shows hard and super
+hard levels), choose a decider for each lane and press **▶ Run all lanes**. Use **+ lane** for up to
+8 lanes. Jev appears as `jev (no key)` until `TYPESAFE_API_KEY` is set.
+
+- **Model calls**: one card per API attempt, newest first, with a live timer while waiting.
+  Expand **Request** to see the exact prompt or Jev arguments, and **Response** to see the parsed
+  answer and the raw body. The API key is never shown.
+- **Board and moves**: the board is drawn from our engine state, so it is a mirror of the game
+  rather than a re-implementation of it. Each chosen move is animated and listed with how it was
+  chosen (confident, re-ask or solver fallback).
+- **Emulator**: tick **Emulator** to poll live screenshots from the connected device (`/screen`),
+  and tick **device** on one lane to have it play the real game.
+
+URL shortcuts: `?level=12&a=gemini&b=solver&delay=500&lanes=2&autorun=1` (`emu=0` hides the
+emulator panel). The HTTP API (`POST /run {lane, level, decider}`, `/pause`, `/resume`, `/step`,
+`/stop`, `GET /events` as SSE, `/state`, `/levels`, `/screen`) can also be scripted.
 
 The bundled `examples/demo-level.json` is a synthetic level, so everything above works without the
 game. To use real levels, extract them from **your own** copy of the APK (never committed):
