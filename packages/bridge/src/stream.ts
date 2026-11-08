@@ -98,7 +98,7 @@ export class ScrcpyStream {
   private readonly serial: string | undefined;
   private readonly maxSize: number;
 
-  constructor(serial = process.env.ANDROID_SERIAL, maxSize = Number(process.env.STREAM_MAX_SIZE ?? 720)) {
+  constructor(serial = process.env.ANDROID_SERIAL || undefined, maxSize = Number(process.env.STREAM_MAX_SIZE || 720)) {
     this.serial = serial;
     this.maxSize = maxSize;
   }

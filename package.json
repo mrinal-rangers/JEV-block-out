@@ -12,9 +12,10 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "levels": "python tools/extract_levels.py",
-    "solve": "node packages/bridge/src/cli.ts solve",
-    "play": "node packages/bridge/src/cli.ts play",
-    "bridge": "node packages/bridge/src/cli.ts serve"
+    "start": "node --env-file-if-exists=.env packages/bridge/src/start.ts",
+    "solve": "node --env-file-if-exists=.env packages/bridge/src/cli.ts solve",
+    "play": "node --env-file-if-exists=.env packages/bridge/src/cli.ts play",
+    "bridge": "node --env-file-if-exists=.env packages/bridge/src/cli.ts serve"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

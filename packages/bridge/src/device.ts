@@ -21,7 +21,7 @@ export function adbPath(): string {
 export class Device {
   readonly serial: string | undefined;
   private readonly adb = adbPath();
-  constructor(serial = process.env.ANDROID_SERIAL) {
+  constructor(serial = process.env.ANDROID_SERIAL || undefined) {
     this.serial = serial;
   }
 

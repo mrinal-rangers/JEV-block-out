@@ -74,18 +74,36 @@ instead of generating text, which is why they are roughly 100× faster than Gemi
 
 ## Quick start
 
-Requires Node ≥ 22.18 (runs TypeScript directly, no build step).
+Bring your own keys and your own copy of the game, then run one command:
 
 ```powershell
+git clone https://github.com/mrinal-rangers/JEV-block-out && cd JEV-block-out
 npm install
+npm start          # first run creates .env: add your keys there, then run npm start again
+```
+
+`npm start`:
+1. Loads `.env` (gitignored, so your keys never leave your machine) and lists which decision models
+   have keys. The offline solver and mock always work.
+2. Uses a connected Android device, or boots your first emulator AVD, and opens Block Out! if it is
+   installed (see [Playing the real game](#playing-the-real-game-on-the-emulator)).
+3. On first run it copies the game APK from that device and extracts its levels into `./levels`
+   (needs Python 3; installs the `UnityPy` package). Without a device it uses the demo level.
+4. Starts the arena, opens it in your browser and runs two lanes. The real game streams beside them.
+
+Flags: `npm start -- --level 12 --port 5180 --no-emulator --no-levels --no-open --no-autorun`.
+
+Requires Node ≥ 22.18 (runs TypeScript directly, no build step). Other commands:
+
+```powershell
 npm test                       # 43 tests
-npm run bridge                 # live arena → http://127.0.0.1:5173/?level=demo
+npm run bridge                 # arena only → http://127.0.0.1:5173/?level=demo
 npm run play -- demo           # same run in the terminal
 ```
 
 ### Live arena
 
-`npm run bridge`, then open <http://127.0.0.1:5173>. Pick a level (the list shows hard and super
+`npm start` (or `npm run bridge`, then open <http://127.0.0.1:5173>). Pick a level (the list shows hard and super
 hard levels), choose a decider for each lane and press **▶ Run all lanes**. Use **+ lane** for up to
 8 lanes. Jev appears as `jev (no key)` until `TYPESAFE_API_KEY` is set.
 

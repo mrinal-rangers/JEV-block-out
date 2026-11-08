@@ -257,7 +257,7 @@ export class OpenAIDecisionsDecider implements Decider {
   private readonly http: ReturnType<typeof httpDefaults>;
 
   constructor(opts: HttpDeciderOptions & { baseUrl?: string } = {}) {
-    this.apiKey = opts.apiKey ?? process.env.OPENAI_API_KEY ?? process.env.AZURE_OPENAI_API_KEY ?? "";
+    this.apiKey = opts.apiKey ?? (process.env.OPENAI_API_KEY || process.env.AZURE_OPENAI_API_KEY || "");
     if (!this.apiKey) throw new Error("openai decider needs OPENAI_API_KEY (or AZURE_OPENAI_API_KEY + OPENAI_BASE_URL)");
     this.baseUrl = (opts.baseUrl ?? (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1")).replace(/\/+$/, "");
     this.model = opts.model ?? (process.env.OPENAI_DECISIONS_MODEL || "gpt-6-luna");
