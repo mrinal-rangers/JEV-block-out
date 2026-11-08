@@ -55,7 +55,10 @@
   .muted { color:var(--muted); font-size:12px; }
   #emu { display:none; min-height:0; flex-direction:column; background:var(--panel); }
   #emu.on { display:flex; }
-  #emu img { width:100%; flex:1; min-height:0; object-fit:contain; background:#000; }
+  #emu #emuScreen { flex:1; min-height:0; display:flex; background:#000; cursor:crosshair; touch-action:none; }
+#emu canvas, #emu img { width:100%; height:100%; object-fit:contain; display:none; }
+#emu canvas.on, #emu img.on { display:block; }
+#emu .lane-head button { padding:2px 8px; }
   #emu .muted { padding:8px 10px; }
   @media (max-width: 1100px) { #arena { grid-template-columns:1fr; overflow:auto; } .lane { min-height:900px; } }
 </style>
@@ -65,7 +68,7 @@
   <h1>Jev × Block Out! <span class="muted">live arena</span></h1>
   <label>Level <input id="level" list="levels" value="demo" size="7" title="level number or 'demo'" /></label>
   <datalist id="levels"><option value="demo">demo board</option></datalist>
-  <label>Move delay <input id="delay" type="number" value="700" min="0" step="100" style="width:72px" /> ms</label>
+  <label>Move delay <input id="delay" type="number" value="200" min="0" step="50" style="width:72px" /> ms</label>
   <label>Max turns <input id="maxTurns" type="number" value="300" min="1" style="width:64px" /></label>
   <button class="primary" id="runAll">▶ Run all lanes</button>
   <button id="pause">Pause</button><button id="resume">Resume</button><button id="step">Step</button><button id="stop">Stop</button>
@@ -75,9 +78,13 @@
 </header>
 <div id="arena">
   <section id="emu">
-    <div class="lane-head"><span class="tag">📱</span> Emulator mirror <span id="emuStatus" class="pill">checking…</span></div>
-    <img id="emuImg" alt="" />
-    <div class="muted">Live <code>adb screencap</code>, refreshed about once a second. Tick <b>device</b> on a lane to play its moves on the emulator too.</div>
+    <div class="lane-head"><span class="tag">📱</span> Real game <span id="emuStatus" class="pill">checking…</span>
+      <span class="spacer"></span>
+      <button id="emuLaunch" title="Open Block Out! on the emulator">▶ Game</button>
+      <button id="emuBack" title="Android back">◀</button>
+      <button id="emuHome" title="Android home">⌂</button></div>
+    <div id="emuScreen"><canvas id="emuCv" width="360" height="800"></canvas><img id="emuImg" alt="" /></div>
+    <div class="muted" id="emuNote">Live H.264 stream of the emulator (scrcpy). Click to tap, drag to swipe. Tick <b>device</b> on a lane to have its decider play the real game.</div>
   </section>
 </div>
 
@@ -120,7 +127,17 @@
 <script>
 const COLORS = { red:"#e74c3c", blue:"#3498db", yellow:"#f1c40f", green:"#2ecc71", purple:"#9b59b6", orange:"#e67e22",
   pink:"#ff7eb6", darkblue:"#2c3e94", turquoise:"#1abc9c", darkgreen:"#1e7d44", white:"#ecf0f1", black:"#2d2d2d" };
-const DECIDERS = ["gemini", "jev", "solver", "mock"];
+const DECIDERS = ["jev", "openai", "clef", "gemini", "solver", "mock"];
+// Legal options sent in a request: Jev/Clef use questions.next_move.criteria, OpenAI Decisions uses a questions[] array of choices.
+function optionsOf(p) {
+  if (!p) return {};
+  if (Array.isArray(p.questions)) {
+    const q = p.questions.find((x) => x.name === "next_move");
+    return Object.fromEntries((q?.choices || []).map((c) => [c.value, c.description]));
+  }
+  const nm = p.questions?.next_move;
+  return nm?.criteria ?? nm?.options ?? p.options ?? {};
+}
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const pct = (v) => v == null ? "–" : (v * 100).toFixed(0) + "%";
@@ -193,10 +210,12 @@ function answerOf(c) {
   if (!c.body) return null;
   if (c.provider === "gemini") return geminiAnswer(c.body);
   if (c.provider === "jev") return c.body.answers ?? c.body;
+  if (c.provider === "clef") return (c.body.result ?? c.body).answers ?? c.body;
+  if (c.provider === "openai") return Array.isArray(c.body.answers) ? Object.fromEntries(c.body.answers.map((a) => [a.name, a])) : c.body;
   return c.body;
 }
 function usageOf(c) {
-  const u = c.body?.usageMetadata, j = c.body?.usage;
+  const u = c.body?.usageMetadata, j = c.body?.usage ?? c.body?.result?.usage;
   if (u) return `${u.promptTokenCount ?? "?"} in · ${u.candidatesTokenCount ?? 0}${u.thoughtsTokenCount ? " + " + u.thoughtsTokenCount + " thinking" : ""} out`;
   if (j) return `${j.input_tokens ?? "?"} in · ${j.output_tokens ?? "?"} out`;
   return "";
@@ -208,7 +227,7 @@ function requestText(c) {
     const { contents, ...rest } = p || {};
     return `POST ${c.endpoint}\n\n── prompt ──\n${prompt}\n\n── generationConfig ──\n${JSON.stringify(rest.generationConfig, null, 2)}`;
   }
-  if (c.provider === "jev") return `${c.endpoint}\n\n${JSON.stringify(p, null, 2)}`;
+  if (["jev", "clef", "openai"].includes(c.provider)) return `${c.endpoint}\n\n${JSON.stringify(p, null, 2)}`;
   return `(local, no network)\n\n${JSON.stringify(p, null, 2)}`;
 }
 function responseText(c) {
@@ -218,12 +237,12 @@ function responseText(c) {
 }
 function summarize(L, c) {
   if (c.error) return `<span class="e">✗ ${esc(c.error)}</span>`;
-  if (c.status && c.status >= 400) return `<span class="e">✗ HTTP ${c.status}: ${esc(c.body?.error?.message ?? "")}</span>`;
+  if (c.status && c.status >= 400) return `<span class="e">✗ HTTP ${c.status}: ${esc(c.body?.error?.message ?? c.body?.errors?.[0]?.message ?? "")}</span>`;
   const a = answerOf(c);
   if (!a || typeof a !== "object") return esc(String(a ?? ""));
-  if (c.provider === "jev") {
+  if (["jev", "clef", "openai"].includes(c.provider)) {
     const m = a.next_move || {};
-    return `→ <b>${esc(L.options[m.choice] || m.choice)}</b> · conf ${pct(m.confidence)} · progress ${a.progress?.score?.toFixed?.(2) ?? "–"} · dead-end ${pct(a.dead_end?.noul)}`;
+    return `→ <b>${esc(L.options[m.choice] || m.choice)}</b> · conf ${pct(m.confidence)} · progress ${a.progress?.score?.toFixed?.(2) ?? "–"} · dead-end ${pct(a.dead_end?.noul ?? a.dead_end?.probability)}`;
   }
   const top = (a.top_moves || []).map((t) => `${esc(t.move)} ${pct(t.probability)}`).join(", ");
   return `→ <b>${esc(L.options[a.next_move] || a.next_move)}</b> · progress ${a.progress ?? "–"} · dead-end ${pct(a.dead_end)}<br><span class="muted">top: ${top}</span>`;
@@ -235,7 +254,7 @@ function addCall(L, e) {
     card.className = "call pending";
     card.dataset.t0 = Date.now();
     const opts = e.payload?.contents ? (e.payload.generationConfig?.responseJsonSchema?.properties?.next_move?.enum?.length)
-      : Object.keys(e.payload?.questions?.next_move?.options ?? e.payload?.options ?? {}).length;
+      : Object.keys(optionsOf(e.payload)).length;
     card.innerHTML = `<div class="call-head"><b>#${e.callId}</b><span>turn ${e.n}</span><span class="pill">${esc(e.round || "")}</span>
       <span>${esc(e.provider)} · <code>${esc(e.model)}</code>${e.attempt > 1 ? ` · attempt ${e.attempt}` : ""}</span><span class="t">⏳ 0.0s</span></div>
       <div class="call-sum muted">waiting… ${opts ? opts + " legal options sent" : ""}</div>
@@ -321,7 +340,7 @@ async function pump(L) {
 function onEvent(e) {
   const L = lanes.get(e.lane) || makeLane(e.lane);
   if (e.type === "start") { resetLane(L, e); return; }
-  if (e.type === "call") { if (e.phase === "request" && e.payload) Object.assign(L.options, e.payload.questions?.next_move?.options ?? e.payload.options ?? {}); if (e.phase === "request" && e.payload?.contents) Object.assign(L.options, parseGeminiOptions(e.payload)); addCall(L, e); return; }
+  if (e.type === "call") { if (e.phase === "request" && e.payload) Object.assign(L.options, optionsOf(e.payload)); if (e.phase === "request" && e.payload?.contents) Object.assign(L.options, parseGeminiOptions(e.payload)); addCall(L, e); return; }
   L.queue.push(e); pump(L);
 }
 function parseGeminiOptions(p) {
@@ -336,7 +355,8 @@ function deciderOptions(sel, pick) {
 }
 function defaultDecider(i) {
   const ok = (d) => info.deciders[d] !== false;
-  const prefs = i === 0 ? ["gemini", "jev", "mock"] : i === 1 ? ["jev", "solver"] : ["mock", "solver"];
+  const fast = ["jev", "openai", "clef"].filter(ok);
+  const prefs = i < fast.length ? [fast[i]] : i === fast.length ? ["solver"] : ["gemini", "mock"];
   return prefs.find(ok) || "mock";
 }
 function makeLane(id) {
@@ -366,20 +386,114 @@ $("runAll").onclick = () => { for (const L of lanes.values()) runLane(L); };
 $("pause").onclick = () => post("/pause"); $("resume").onclick = () => post("/resume"); $("step").onclick = () => post("/step"); $("stop").onclick = () => post("/stop");
 $("addLane").onclick = () => { const id = "abcdefgh".split("").find((c) => !lanes.has(c)); if (id) makeLane(id); };
 
-// ---------- emulator mirror ----------
+// ---------- real game: live H.264 stream (scrcpy → /video → WebCodecs), screenshots as fallback ----------
+const emu = { ctrl: null, dec: null, codec: "", config: null, needKey: true, ts: 0, frames: 0, fallback: !("VideoDecoder" in window), fails: 0 };
+function emuStatus(text, cls) { $("emuStatus").textContent = text; $("emuStatus").className = "pill " + (cls || ""); }
+function showSurface(video) { $("emuCv").classList.toggle("on", video); $("emuImg").classList.toggle("on", !video); }
+function avcCodec(cfg) {
+  for (let i = 0; i + 7 < cfg.length; i++) {
+    if (cfg[i] === 0 && cfg[i + 1] === 0 && cfg[i + 2] === 1 && (cfg[i + 3] & 0x1f) === 7) {
+      return "avc1." + [cfg[i + 4], cfg[i + 5], cfg[i + 6]].map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+  }
+  return "avc1.42c01f";
+}
+function makeDecoder(codec) {
+  try { emu.dec?.close(); } catch {}
+  const cv = $("emuCv"), cx = cv.getContext("2d");
+  emu.dec = new VideoDecoder({
+    output: (f) => {
+      if (cv.width !== f.displayWidth || cv.height !== f.displayHeight) { cv.width = f.displayWidth; cv.height = f.displayHeight; }
+      cx.drawImage(f, 0, 0); f.close();
+      if (!emu.frames++) { showSurface(true); emuStatus("live · video", "won"); }
+    },
+    error: (e) => { emuStatus("decoder: " + e.message, "bad"); emu.needKey = true; },
+  });
+  emu.dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: "no-preference" });
+  emu.codec = codec; emu.needKey = true;
+}
+function onVideoPacket(flags, data) {
+  if (flags & 1) { emu.config = data; const c = avcCodec(data); if (c !== emu.codec || emu.dec?.state !== "configured") makeDecoder(c); return; }
+  const key = !!(flags & 2);
+  if (!emu.dec || emu.dec.state !== "configured" || (emu.needKey && !key)) return;
+  let bytes = data;
+  if (key && emu.config) { bytes = new Uint8Array(emu.config.length + data.length); bytes.set(emu.config); bytes.set(data, emu.config.length); }
+  emu.dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (emu.ts += 33333), data: bytes }));
+  if (key) emu.needKey = false;
+}
+function stopVideo() { emu.ctrl?.abort(); emu.ctrl = null; }
+async function startVideo() {
+  stopVideo();
+  if (emu.fallback || !$("emuToggle").checked) return;
+  const ctrl = (emu.ctrl = new AbortController());
+  emu.frames = 0; emu.codec = ""; emu.needKey = true;
+  emuStatus("connecting…");
+  try {
+    const r = await fetch("/video", { signal: ctrl.signal });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
+    emu.fails = 0;
+    const reader = r.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const nb = new Uint8Array(buf.length + value.length); nb.set(buf); nb.set(value, buf.length); buf = nb;
+      let off = 0;
+      while (buf.length - off >= 5) {
+        const len = new DataView(buf.buffer, buf.byteOffset + off + 1, 4).getUint32(0);
+        if (buf.length - off < 5 + len) break;
+        onVideoPacket(buf[off], buf.slice(off + 5, off + 5 + len));
+        off += 5 + len;
+      }
+      buf = buf.slice(off);
+    }
+    if (ctrl.signal.aborted) return;
+    emuStatus("stream ended", "bad");
+  } catch (e) {
+    if (ctrl.signal.aborted) return;
+    emuStatus(String(e.message || e).slice(0, 80), "bad"); $("emuStatus").title = String(e.message || e);
+    if (++emu.fails >= 3) { emu.fallback = true; $("emuNote").textContent = "Video stream unavailable — showing adb screenshots about once a second instead. Click to tap, drag to swipe."; }
+  }
+  if (emu.ctrl === ctrl) setTimeout(() => emu.ctrl === ctrl && startVideo(), 1500);
+}
 let emuBusy = false;
 async function refreshEmu() {
-  if (!$("emuToggle").checked || emuBusy) return;
+  if (!emu.fallback || !$("emuToggle").checked || emuBusy) return;
   emuBusy = true;
   try {
     const r = await fetch("/screen?t=" + Date.now());
-    if (r.ok) { const url = URL.createObjectURL(await r.blob()); const img = $("emuImg"); const old = img.src; img.src = url; if (old.startsWith("blob:")) URL.revokeObjectURL(old); $("emuStatus").textContent = "live"; $("emuStatus").className = "pill won"; }
-    else { $("emuStatus").textContent = "no device"; $("emuStatus").className = "pill bad"; }
-  } catch { $("emuStatus").textContent = "offline"; $("emuStatus").className = "pill bad"; }
+    if (r.ok) { const url = URL.createObjectURL(await r.blob()); const img = $("emuImg"); const old = img.src; img.src = url; if (old.startsWith("blob:")) URL.revokeObjectURL(old); showSurface(false); emuStatus("live · screenshots", "won"); }
+    else emuStatus("no device", "bad");
+  } catch { emuStatus("offline", "bad"); }
   emuBusy = false;
 }
 setInterval(refreshEmu, 1000);
-$("emuToggle").onchange = () => { $("emu").classList.toggle("on", $("emuToggle").checked); layout(); refreshEmu(); };
+// Click = tap, drag = swipe; coordinates are sent as 0..1 of the device screen (letterboxing removed).
+function screenPoint(ev) {
+  const el = emu.fallback ? $("emuImg") : $("emuCv"), r = el.getBoundingClientRect();
+  const iw = emu.fallback ? el.naturalWidth : el.width, ih = emu.fallback ? el.naturalHeight : el.height;
+  if (!iw || !ih) return null;
+  const s = Math.min(r.width / iw, r.height / ih), w = iw * s, h = ih * s, ox = r.left + (r.width - w) / 2, oy = r.top + (r.height - h) / 2;
+  const x = (ev.clientX - ox) / w, y = (ev.clientY - oy) / h;
+  return x < 0 || y < 0 || x > 1 || y > 1 ? null : { x, y };
+}
+let press = null;
+$("emuScreen").addEventListener("pointerdown", (ev) => { press = { p: screenPoint(ev), t: performance.now() }; ev.preventDefault(); });
+$("emuScreen").addEventListener("pointerup", (ev) => {
+  const a = press?.p, b = screenPoint(ev), ms = performance.now() - (press?.t || 0); press = null;
+  if (!a || !b) return;
+  const moved = Math.hypot(a.x - b.x, a.y - b.y) > 0.02;
+  post("/input", moved ? { type: "swipe", x: a.x, y: a.y, x2: b.x, y2: b.y, ms: Math.max(150, ms) } : { type: "tap", x: a.x, y: a.y })
+    .then((j) => j.error && emuStatus(j.error, "bad"));
+});
+$("emuLaunch").onclick = () => post("/input", { type: "launch" });
+$("emuBack").onclick = () => post("/input", { type: "key", key: "back" });
+$("emuHome").onclick = () => post("/input", { type: "key", key: "home" });
+$("emuToggle").onchange = () => {
+  const on = $("emuToggle").checked;
+  $("emu").classList.toggle("on", on); layout();
+  if (on) { startVideo(); refreshEmu(); } else stopVideo();
+};
 
 // ---------- boot ----------
 (async () => {

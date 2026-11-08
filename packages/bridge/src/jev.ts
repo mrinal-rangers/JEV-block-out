@@ -23,7 +23,7 @@ export interface Decision {
   latencyMs: number;
   tokens: { input: number | null; output: number | null };
   model: string;
-  source: "jev" | "gemini" | "mock";
+  source: "jev" | "clef" | "openai" | "gemini" | "mock";
 }
 
 /** One model round-trip, reported twice (request, then response) so a viewer can show calls in flight. */
@@ -105,11 +105,7 @@ export class JevDecider implements Decider {
 
   async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
     const t0 = performance.now();
-    const questions = {
-      next_move: choice(NEXT_MOVE_INSTRUCTIONS, req.options),
-      progress: score("How close is this position to being solved?", PROGRESS_RUBRIC),
-      dead_end: noul(DEAD_END_STATEMENT),
-    };
+    const questions = systemOneQuestions(req);
     const args = { state: req.view as never, questions, ...(this.model ? { model: this.model } : {}) };
     const res = await traced(
       trace,
@@ -119,17 +115,196 @@ export class JevDecider implements Decider {
         return { status: 200, body: r, value: r };
       },
     );
-    const a = res.answers;
+    return fromSystemOne(res, "jev", t0, this.model ?? "jev");
+  }
+}
+
+export const PROGRESS_LABELS = ["Jammed", "Little progress", "Some progress", "Good progress", "Nearly solved"] as const;
+
+/** System One questions (Jev's schema; Cloudflare Clef accepts the same body). */
+export function systemOneQuestions(req: DecisionRequest) {
+  return {
+    next_move: choice(NEXT_MOVE_INSTRUCTIONS, req.options),
+    progress: score("How close is this position to being solved?", PROGRESS_RUBRIC),
+    dead_end: noul(DEAD_END_STATEMENT),
+  };
+}
+
+/** Maps a System One response ({model, answers:{next_move, progress, dead_end}, usage}) to a Decision. */
+function fromSystemOne(res: any, source: Decision["source"], t0: number, fallbackModel: string): Decision {
+  const a = res?.answers ?? {};
+  const m = a.next_move;
+  if (!m || typeof m.choice !== "string") throw new Error(`${source}: response has no next_move answer`);
+  return {
+    choice: m.choice,
+    probabilities: { ...(m.probabilities ?? { [m.choice]: 1 }) } as Record<string, number>,
+    confidence: Number(m.confidence ?? m.probabilities?.[m.choice] ?? 0),
+    progress: typeof a.progress?.score === "number" ? a.progress.score : null,
+    deadEnd: typeof a.dead_end?.noul === "number" ? a.dead_end.noul : null,
+    latencyMs: Math.round(performance.now() - t0),
+    tokens: { input: res?.usage?.input_tokens ?? null, output: res?.usage?.output_tokens ?? null },
+    model: res?.model ?? fallbackModel,
+    source,
+  };
+}
+
+export interface HttpDeciderOptions {
+  apiKey?: string;
+  model?: string;
+  /** Per-request timeout; default 20 s. */
+  timeoutMs?: number;
+  /** Retries on 429 / 5xx / network errors; default 3. */
+  maxRetries?: number;
+  fetch?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** POST JSON with tracing, a timeout and short exponential backoff on 429/5xx/network errors. */
+async function postJson(
+  o: { provider: string; model: string; endpoint: string; headers: Record<string, string>; body: unknown },
+  opts: Required<Pick<HttpDeciderOptions, "timeoutMs" | "maxRetries" | "fetch" | "sleep">>,
+  trace?: CallTracer,
+): Promise<any> {
+  let lastErr = "";
+  for (let attempt = 0; attempt <= opts.maxRetries; attempt++) {
+    const callId = nextCallId++;
+    const head = { provider: o.provider, model: o.model, attempt: attempt + 1, callId };
+    trace?.({ ...head, phase: "request", endpoint: o.endpoint, payload: o.body });
+    const t0 = performance.now();
+    let status = 0;
+    try {
+      const res = await opts.fetch(o.endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...o.headers },
+        body: JSON.stringify(o.body),
+        signal: AbortSignal.timeout(opts.timeoutMs),
+      });
+      status = res.status;
+      const raw = await res.text();
+      let data: any;
+      try { data = raw ? JSON.parse(raw) : {}; } catch { data = raw.slice(0, 2000); }
+      trace?.({ ...head, phase: "response", status, ms: Math.round(performance.now() - t0), body: data });
+      if (res.ok) return data;
+      const msg = data?.error?.message ?? data?.errors?.[0]?.message ?? (typeof data === "string" ? data : JSON.stringify(data).slice(0, 300));
+      lastErr = `${o.provider} API ${status} (${o.model}): ${msg}`;
+      if (status !== 429 && status < 500) throw new Error(lastErr);
+    } catch (err) {
+      const e = err as Error;
+      if (e.message === lastErr) throw e;
+      const msg = e?.name === "TimeoutError" ? `timed out after ${opts.timeoutMs} ms` : String(e?.message ?? err);
+      trace?.({ ...head, phase: "response", status: 0, ms: Math.round(performance.now() - t0), error: msg });
+      lastErr = `${o.provider} network error (${o.model}): ${msg}`;
+    }
+    if (attempt < opts.maxRetries) await opts.sleep(Math.min(8000, 400 * 2 ** attempt));
+  }
+  throw new Error(lastErr);
+}
+
+function httpDefaults(opts: HttpDeciderOptions) {
+  return {
+    timeoutMs: opts.timeoutMs ?? 20_000,
+    maxRetries: opts.maxRetries ?? 3,
+    fetch: opts.fetch ?? fetch,
+    sleep: opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
+  };
+}
+
+/**
+ * Cloudflare Clef (Workers AI) — an open-weights decision model that speaks Jev's System One schema.
+ * Free: 10,000 Neurons/day on the Workers Free plan (≈2.9M input tokens/day with clef-flash). Needs
+ * CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN (Workers AI permission); CLEF_MODEL = clef-flash (default) | clef.
+ */
+export class ClefDecider implements Decider {
+  readonly name = "clef";
+  private readonly token: string;
+  private readonly accountId: string;
+  private readonly model: string;
+  private readonly http: ReturnType<typeof httpDefaults>;
+
+  constructor(opts: HttpDeciderOptions & { accountId?: string } = {}) {
+    this.token = opts.apiKey ?? process.env.CLOUDFLARE_API_TOKEN ?? "";
+    this.accountId = opts.accountId ?? process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
+    if (!this.token || !this.accountId) {
+      throw new Error("clef decider needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN (free: https://dash.cloudflare.com → Workers AI)");
+    }
+    this.model = opts.model ?? (process.env.CLEF_MODEL || "clef-flash");
+    this.http = httpDefaults(opts);
+  }
+
+  async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
+    const t0 = performance.now();
+    const endpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.accountId)}/ai/run/@cf/cloudflare/${this.model}`;
+    const body = { model: this.model, state: req.view, questions: systemOneQuestions(req) };
+    const data = await postJson(
+      { provider: "clef", model: this.model, endpoint, headers: { authorization: `Bearer ${this.token}` }, body },
+      this.http,
+      trace,
+    );
+    return fromSystemOne(data?.result ?? data, "clef", t0, this.model);
+  }
+}
+
+/**
+ * OpenAI Decisions API (POST /v1/decisions, model gpt-6-luna) — Choice / Score / Predicate with probabilities.
+ * OpenAI: OPENAI_API_KEY. Azure OpenAI: OPENAI_BASE_URL=https://RESOURCE.openai.azure.com/openai/v1 plus
+ * AZURE_OPENAI_API_KEY (or OPENAI_API_KEY); OPENAI_DECISIONS_MODEL = deployment name (default gpt-6-luna).
+ */
+export class OpenAIDecisionsDecider implements Decider {
+  readonly name = "openai";
+  private readonly apiKey: string;
+  private readonly baseUrl: string;
+  private readonly model: string;
+  private readonly http: ReturnType<typeof httpDefaults>;
+
+  constructor(opts: HttpDeciderOptions & { baseUrl?: string } = {}) {
+    this.apiKey = opts.apiKey ?? process.env.OPENAI_API_KEY ?? process.env.AZURE_OPENAI_API_KEY ?? "";
+    if (!this.apiKey) throw new Error("openai decider needs OPENAI_API_KEY (or AZURE_OPENAI_API_KEY + OPENAI_BASE_URL)");
+    this.baseUrl = (opts.baseUrl ?? (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1")).replace(/\/+$/, "");
+    this.model = opts.model ?? (process.env.OPENAI_DECISIONS_MODEL || "gpt-6-luna");
+    this.http = httpDefaults(opts);
+  }
+
+  async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
+    const t0 = performance.now();
+    const azure = /\.azure\.com|\.azure-api\.net/i.test(this.baseUrl);
+    const headers: Record<string, string> = azure ? { "api-key": this.apiKey } : { authorization: `Bearer ${this.apiKey}` };
+    const body = {
+      model: this.model,
+      input: `Block Out! position (JSON):\n${JSON.stringify(req.view)}`,
+      questions: [
+        {
+          type: "choice", name: "next_move", instructions: NEXT_MOVE_INSTRUCTIONS,
+          choices: Object.entries(req.options).map(([value, description]) => ({ value, description })),
+        },
+        {
+          type: "score", name: "progress", instructions: "How close is this position to being solved?",
+          levels: PROGRESS_RUBRIC.map((description, i) => ({ label: PROGRESS_LABELS[i], description })),
+        },
+        { type: "predicate", name: "dead_end", instructions: `Is this statement true? ${DEAD_END_STATEMENT}` },
+      ],
+    };
+    const data = await postJson(
+      { provider: "openai", model: this.model, endpoint: `${this.baseUrl}/decisions`, headers, body },
+      this.http,
+      trace,
+    );
+    const by: Record<string, any> = {};
+    for (const a of Array.isArray(data?.answers) ? data.answers : []) if (a?.name) by[a.name] = a;
+    const m = by.next_move;
+    if (!m || m.type === "refusal") throw new Error(`openai: next_move ${m ? "was refused" : "missing from response"}`);
+    const probabilities: Record<string, number> = {};
+    for (const p of m.probabilities ?? []) probabilities[String(p.value)] = Number(p.probability);
+    const pick = String(m.choice);
     return {
-      choice: a.next_move.choice,
-      probabilities: { ...a.next_move.probabilities } as Record<string, number>,
-      confidence: a.next_move.confidence,
-      progress: a.progress.score,
-      deadEnd: a.dead_end.noul,
+      choice: pick,
+      probabilities: Object.keys(probabilities).length ? probabilities : { [pick]: 1 },
+      confidence: Number(m.confidence ?? probabilities[pick] ?? 0),
+      progress: by.progress?.type === "score" ? Number(by.progress.score) : null,
+      deadEnd: by.dead_end?.type === "predicate" ? Number(by.dead_end.probability) : null,
       latencyMs: Math.round(performance.now() - t0),
-      tokens: { input: res.usage.input_tokens, output: res.usage.output_tokens },
-      model: res.model,
-      source: "jev",
+      tokens: { input: data?.usage?.input_tokens ?? null, output: data?.usage?.output_tokens ?? null },
+      model: data?.model ?? this.model,
+      source: "openai",
     };
   }
 }
@@ -453,18 +628,35 @@ function localAnswer(d: Decision): Record<string, unknown> {
 }
 
 /**
- * kind: "jev" | "gemini" | "mock" | "solver" | "auto" (or empty).
- * Auto = JEV_DECIDER, else jev when TYPESAFE_API_KEY is set, else gemini when GEMINI_API_KEY is set, else mock.
+ * kind: "jev" | "openai" | "clef" | "gemini" | "mock" | "solver" | "auto" (or empty).
+ * Auto = JEV_DECIDER, else the first decision model with a key: jev (TYPESAFE_API_KEY) → openai (OPENAI_API_KEY /
+ * AZURE_OPENAI_API_KEY) → clef (CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN) → gemini (GEMINI_API_KEY) → mock.
  */
 export function makeDecider(kind?: string): Decider {
   let k = kind && kind !== "auto" ? kind : process.env.JEV_DECIDER;
-  if (!k || k === "auto") k = process.env.TYPESAFE_API_KEY ? "jev" : process.env.GEMINI_API_KEY ? "gemini" : "mock";
+  if (!k || k === "auto") k = AUTO_ORDER.find((d) => deciderConfigured(d)) ?? "mock";
   if (k === "solver") return new SolverDecider();
   if (k === "jev") {
     if (!process.env.TYPESAFE_API_KEY) throw new Error("JEV_DECIDER=jev needs TYPESAFE_API_KEY (see .env.example)");
     return new JevDecider();
   }
+  if (k === "openai") return new OpenAIDecisionsDecider();
+  if (k === "clef") return new ClefDecider();
   if (k === "gemini") return new GeminiDecider();
-  if (k !== "mock") throw new Error(`Unknown decider "${k}" (use jev, gemini, mock, solver or auto)`);
+  if (k !== "mock") throw new Error(`Unknown decider "${k}" (use jev, openai, clef, gemini, mock, solver or auto)`);
   return new MockDecider();
+}
+
+const AUTO_ORDER = ["jev", "openai", "clef", "gemini"] as const;
+
+/** Whether the env has the credentials a decider kind needs (local deciders are always available). */
+export function deciderConfigured(kind: string): boolean {
+  const e = process.env;
+  switch (kind) {
+    case "jev": return !!e.TYPESAFE_API_KEY;
+    case "openai": return !!(e.OPENAI_API_KEY || e.AZURE_OPENAI_API_KEY);
+    case "clef": return !!(e.CLOUDFLARE_API_TOKEN && e.CLOUDFLARE_ACCOUNT_ID);
+    case "gemini": return !!e.GEMINI_API_KEY;
+    default: return kind === "mock" || kind === "solver";
+  }
 }

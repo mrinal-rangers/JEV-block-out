@@ -19,8 +19,8 @@ checkpoint is completed. Detailed rationale lives in [AGENDA.md](./AGENDA.md).
 | M0 | Environment spike (go/no-go) | 5 / 8 (1 deferred, 1 blocked on ToS) |
 | M1 | Game state extraction | 4 / 5 (on-device check blocked on ToS) |
 | M2 | Move execution | 0 / 4 (all built and tested in sim; on-device blocked on ToS) |
-| M3 | Jev integration | 6 / 8 (first Jev solve needs API key; first Gemini solve needs a free key) |
-| M4 | Live simulation dashboard | 1 / 4 (4.2, 4.3 partly done) |
+| M3 | Jev integration | 7 / 9 (first Jev / Clef solve needs an API key) |
+| M4 | Live simulation dashboard | 1 / 4 (4.2, 4.3 partly done; live game video streaming works) |
 | M5 | Harder mechanics & evaluation | 0 / 4 (5.3 baseline started) |
 
 ---
@@ -74,6 +74,7 @@ x86_64 emulator.
 | 3.6 | **First level solved by Jev** 🎉 | 🤖 | ⛔ | Needs `TYPESAFE_API_KEY` (0.2). Mock decider already wins the demo level end-to-end |
 | 3.7 | Free alternative decider: Gemini API (`--decider gemini`) | 🤖 | ✅ | `GeminiDecider` in `packages/bridge/src/jev.ts`: enum-constrained structured output, self-reported probs, throttle + 429 retry; 5 fake-fetch tests. Live endpoint reached (400 on dummy key) |
 | 3.8 | First level solved by Gemini | 👤🤖 | ✅ | Demo in 7 moves, level 1 in 3. Level 12 not solved in 150 moves (solver: 34) |
+| 3.9 | Fast decision-model deciders | 🤖 | ✅ | `clef` (Cloudflare Workers AI, free daily allowance, Jev-compatible) and `openai` (Decisions API, Azure too); `auto` = jev → openai → clef → gemini → mock |
 
 ## M4 — Live simulation dashboard
 
@@ -81,7 +82,7 @@ x86_64 emulator.
 | - | - | - | - | - |
 | 4.1 | Dashboard streaming decisions | 🤖 | ✅ | Live arena at `npm run bridge`: parallel lanes, live model-call feed (request/response), board animation, move list ([screenshot](./docs/viewer.png)) |
 | 4.2 | Probability bars, confidence, latency, cost | 🤖 | 🟨 | Bars, confidence, progress, P(dead end), latency and tokens done; cost pending real Jev usage |
-| 4.3 | scrcpy mirror + one-command `start` script | 🤖 | 🟨 | Emulator screenshot mirror in the arena (`/screen`); `npm start` script pending |
+| 4.3 | scrcpy mirror + one-command `start` script | 🤖 | 🟨 | Live H.264 game stream in the arena (scrcpy-server → `/video` → WebCodecs) with click/drag input (`/input`); `npm start` script pending |
 | 4.4 | Demo recording in README | 👤🤖 | ⬜ | GIF/video linked |
 
 ## M5 — Harder mechanics & evaluation
@@ -109,3 +110,4 @@ x86_64 emulator.
 | 2026-11-08 | 3.7 | Free alternative to Jev: `gemini` decider (Google AI Studio key, free tier). Also considered GitHub Models, OpenRouter free, Groq, Ollama. `auto` falls back jev → gemini → mock. |
 | 2026-11-08 | 3.8 | Gemini key added (user env only). `gemini-3.8-flash` returned 503, so the default is now 3.6-flash with a 3.5-flash-lite fallback, 60 s timeouts and a primary retry every 10 calls. The runner now avoids revisiting board states. Gemini solved the demo and level 1; level 12 is unsolved. |
 | 2026-11-08 | 4.1, 4.3 | Live arena: several deciders run in parallel lanes on one level. Every model call is traced (request, raw response, latency, tokens, errors) and streamed over SSE, with an optional emulator screenshot mirror. Gemini and the solver both solved level 1 side by side in 3 moves. |
+| 2026-11-08 | 3.9, 4.3 | Gemini was too slow (9–30 s per move), so fast decision models were added: Cloudflare Clef (free) and the OpenAI Decisions API, next to Jev. The default move delay is now 200 ms. The screenshot mirror was replaced with a live scrcpy H.264 stream decoded in the browser, with tap/swipe input. The user installs the game themselves. |

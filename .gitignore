@@ -12,6 +12,8 @@ levels/
 logs/
 shots/
 calibration.json
+# Downloaded tools (scrcpy-server)
+.cache/
 
 # Secrets
 .env

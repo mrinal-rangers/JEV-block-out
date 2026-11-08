@@ -50,6 +50,22 @@ export class Device {
     await this.shell(`monkey -p ${GAME_PACKAGE} -c android.intent.category.LAUNCHER 1`);
   }
 
+  async isGameInstalled(): Promise<boolean> {
+    return (await this.shell(`pm path ${GAME_PACKAGE}`)).includes("package:");
+  }
+
+  async tap(x: number, y: number): Promise<void> {
+    await this.shell(`input tap ${Math.round(x)} ${Math.round(y)}`);
+  }
+
+  async swipe(x1: number, y1: number, x2: number, y2: number, ms = 300): Promise<void> {
+    await this.shell(`input swipe ${Math.round(x1)} ${Math.round(y1)} ${Math.round(x2)} ${Math.round(y2)} ${Math.round(ms)}`);
+  }
+
+  async key(name: "back" | "home" | "appswitch"): Promise<void> {
+    await this.shell(`input keyevent ${{ back: "KEYCODE_BACK", home: "KEYCODE_HOME", appswitch: "KEYCODE_APP_SWITCH" }[name]}`);
+  }
+
   /** Press, move through each waypoint in small steps, release — one adb shell call so timing stays tight. */
   async drag(points: { x: number; y: number }[], stepPx = 40): Promise<void> {
     if (points.length < 2) return;

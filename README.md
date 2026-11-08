@@ -57,9 +57,20 @@ flowchart LR
    animating move by move, the probability of each option, and the move list. An optional panel
    mirrors the emulator screen.
 
-Deciders: `jev` (needs key), `gemini` (free Gemini API key, see below), `mock` (offline stand-in:
-one-ply lookahead softmax), `solver` (weighted A*, plays the optimal plan). `auto` = jev if`
-`TYPESAFE_API_KEY` is set, else gemini if `GEMINI_API_KEY` is set, else mock.
+Deciders:
+
+| Decider | Model | Latency / move | Cost | Key |
+| - | - | - | - | - |
+| `jev` | TypeSafe Jev (System One) | ~0.1–0.5 s | $5 free credit with Google login at [console.typesafe.ai](https://console.typesafe.ai) | `TYPESAFE_API_KEY` |
+| `clef` | Cloudflare Workers AI **Clef / Clef-flash** (Jev System One compatible, open weights) | ~0.05–0.3 s | **Free:** 10,000 Neurons/day on the Workers Free plan (about 1,000+ moves/day with `clef-flash`) | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` |
+| `openai` | OpenAI **Decisions API** (`gpt-6-luna`), also on Azure OpenAI | ~0.15 s | paid, about $0.10 / M input tokens | `OPENAI_API_KEY` (or `AZURE_OPENAI_API_KEY` + `OPENAI_BASE_URL`) |
+| `gemini` | Gemini Flash, general LLM with JSON output | 9–30 s (thinking) | free tier | `GEMINI_API_KEY` |
+| `mock` | offline one-ply lookahead softmax | instant | free | – |
+| `solver` | weighted A*, plays the optimal plan | instant | free | – |
+
+`auto` picks the first configured one of jev → openai → clef → gemini, else mock. Jev, Clef and
+OpenAI Decisions are *decision models*: they score the legal options we send in one forward pass
+instead of generating text, which is why they are roughly 100× faster than Gemini here.
 
 ## Quick start
 
@@ -67,7 +78,7 @@ Requires Node ≥ 22.18 (runs TypeScript directly, no build step).
 
 ```powershell
 npm install
-npm test                       # 37 tests
+npm test                       # 43 tests
 npm run bridge                 # live arena → http://127.0.0.1:5173/?level=demo
 npm run play -- demo           # same run in the terminal
 ```
@@ -84,12 +95,16 @@ hard levels), choose a decider for each lane and press **▶ Run all lanes**. Us
 - **Board and moves**: the board is drawn from our engine state, so it is a mirror of the game
   rather than a re-implementation of it. Each chosen move is animated and listed with how it was
   chosen (confident, re-ask or solver fallback).
-- **Emulator**: tick **Emulator** to poll live screenshots from the connected device (`/screen`),
-  and tick **device** on one lane to have it play the real game.
+- **Real game**: tick **Emulator** to stream the actual game from the emulator as live H.264 video
+  (scrcpy-server over adb, decoded in the browser with WebCodecs, ~30 fps). Click the video to tap
+  and drag to swipe; **▶ Game**, **◀** and **⌂** open the game, press back and go home. Tick
+  **device** on one lane to have its decider play the real game. If the browser lacks WebCodecs or the
+  stream fails, the panel falls back to adb screenshots once a second.
 
-URL shortcuts: `?level=12&a=gemini&b=solver&delay=500&lanes=2&autorun=1` (`emu=0` hides the
+URL shortcuts: `?level=12&a=jev&b=solver&delay=200&lanes=2&autorun=1` (`emu=0` hides the
 emulator panel). The HTTP API (`POST /run {lane, level, decider}`, `/pause`, `/resume`, `/step`,
-`/stop`, `GET /events` as SSE, `/state`, `/levels`, `/screen`) can also be scripted.
+`/stop`, `POST /input {type: tap|swipe|key|launch}`, `GET /events` as SSE, `/state`, `/levels`,
+`/screen`, `/video`) can also be scripted.
 
 The bundled `examples/demo-level.json` is a synthetic level, so everything above works without the
 game. To use real levels, extract them from **your own** copy of the APK (never committed):
@@ -104,13 +119,24 @@ npm run play -- 12 --decider gemini           # same with the free Gemini decide
 
 Settings are environment variables — see [.env.example](./.env.example).
 
-### Playing on the emulator
+### Playing the real game on the emulator
+
+**Requirement:** the real game must be installed on an Android emulator (or a phone with USB
+debugging). Download Block Out! yourself (e.g. the [APKPure XAPK](https://apkpure.com/block-out-color-sort-puzzle/com.grandgames.catblockjam)
+or Google Play) and install it — we never redistribute it:
 
 ```powershell
 emulator -avd blockout -no-snapshot -no-audio -gpu swiftshader_indirect -no-boot-anim `
   -memory 4096 -cores 4 -feature "-Vulkan,GLESDynamicVersion"
-npm run play -- 1 --device                    # or tick "device" in the viewer
+adb install-multiple base.apk config.armeabi_v7a.apk   # files from your XAPK
+npm run bridge                                         # tick "Emulator" → live video of the game
+npm run play -- 1 --device                             # or tick "device" on a lane
 ```
+
+On first launch, accept the game's terms yourself in the streamed video (the bot never accepts legal
+agreements for you). The streaming server (`scrcpy-server` v5.0.1, Apache-2.0) is downloaded once
+into `packages/bridge/.cache/` and checked against its published SHA-256; set `SCRCPY_SERVER` to use
+your own copy and `STREAM_MAX_SIZE` to change the resolution (default 720).
 
 Open the level in the game first; the bridge then drives it with adb. Screen calibration is guessed
 per board size and can be overridden in `calibration.json`.
@@ -120,7 +146,7 @@ per board size and can be overridden in `calibration.json`.
 | Path | What |
 | - | - |
 | `packages/core` | `GameState` types, level parser, rules engine, solver, ASCII renderer |
-| `packages/bridge` | Jev / Gemini / mock / solver deciders, routing agent, runner, adb device, HTTP/SSE server, CLI, viewer (`public/`) |
+| `packages/bridge` | Jev / Clef / OpenAI Decisions / Gemini / mock / solver deciders, routing agent, runner, adb device, scrcpy video stream, HTTP/SSE server, CLI, viewer (`public/`) |
 | `schema/` | `game-state.schema.json` |
 | `examples/` | synthetic demo level + example state |
 | `tools/extract_levels.py` | pulls level TextAssets out of your APK |
@@ -133,7 +159,8 @@ per board size and can be overridden in `calibration.json`.
 | Game runtime | Android emulator, API 30 x86_64 Google APIs image (ARM translation) |
 | State | Level JSON from APK (UnityPy) + own rules engine; adb screenshots for settle/verify |
 | Bridge | Node.js + TypeScript (native type stripping), `node:http` + SSE |
-| Decision model | Jev via `@typesafe-ai/sdk`; free fallback: Gemini API (REST, no SDK) |
+| Decision model | Jev via `@typesafe-ai/sdk`; Cloudflare Clef (free tier) and OpenAI Decisions API over REST; Gemini as a slow LLM baseline |
+| Game stream | scrcpy-server → adb forward → Node → browser WebCodecs `VideoDecoder` (H.264) |
 | Viewer | Single-file HTML + canvas |
 | Tests | Vitest |
 
@@ -145,7 +172,28 @@ per board size and can be overridden in `calibration.json`.
 - Pricing (published): input $0.042 / MTok, output free. At ~2k tokens/move and ~30 moves/level,
   a level costs roughly **$0.003**.
 
-## Free alternative: Gemini
+## Free, fast alternative: Cloudflare Clef
+
+Clef is a Jev System One–compatible decision model on Cloudflare Workers AI, so the `clef` decider
+sends exactly the same `next_move` / `progress` / `dead_end` questions as `jev`.
+
+1. Sign up at [dash.cloudflare.com](https://dash.cloudflare.com) (free plan, no card).
+2. Copy your **Account ID** (Workers & Pages overview) and create an API token with the
+   **Workers AI** template (Profile → API Tokens).
+3. `setx CLOUDFLARE_ACCOUNT_ID <id>` and `setx CLOUDFLARE_API_TOKEN <token>`, then open a new terminal.
+4. Pick **clef** in the arena. `CLEF_MODEL=clef` uses the larger model (default `clef-flash`).
+
+The free allowance is 10,000 Neurons a day, reset at 00:00 UTC.
+
+## OpenAI Decisions API
+
+`openai` calls `POST /v1/decisions` with a `choice` question over the legal moves, a 5-level
+`score` for progress and a `predicate` for dead ends (one request, ~150 ms). Set `OPENAI_API_KEY`
+(model `gpt-6-luna`, override with `OPENAI_DECISIONS_MODEL`). For Azure OpenAI set
+`AZURE_OPENAI_API_KEY`, `OPENAI_BASE_URL=https://<resource>.openai.azure.com/openai/v1` and
+`OPENAI_DECISIONS_MODEL=<deployment name>`.
+
+## Slow baseline: Gemini
 
 No Jev key yet? The `gemini` decider asks the same three questions in one Gemini API call.
 

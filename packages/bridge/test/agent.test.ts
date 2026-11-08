@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { applyMove, legalMoves, moveId, parseLevel, type GameState } from "@jev-block-out/core";
 import { buildRequest, decideTurn, DEFAULT_AGENT_CONFIG, stateKey } from "../src/agent.ts";
-import { GeminiDecider, makeDecider, MockDecider, type CallEvent, type Decider, type Decision, type DecisionRequest } from "../src/jev.ts";
+import { ClefDecider, GeminiDecider, makeDecider, MockDecider, OpenAIDecisionsDecider, type CallEvent, type Decider, type Decision, type DecisionRequest } from "../src/jev.ts";
 import { Runner } from "../src/runner.ts";
 import { cellCenter, dragPath, guessCalibration } from "../src/screen.ts";
 import { DEMO_LEVEL } from "../src/server.ts";
@@ -141,30 +141,135 @@ describe("revisit avoidance", () => {
 });
 
 describe("makeDecider", () => {
+  const KEYS = ["TYPESAFE_API_KEY", "JEV_DECIDER", "GEMINI_API_KEY", "OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"];
   it("resolves auto / empty / env and rejects unknown kinds", () => {
-    const saved = { key: process.env.TYPESAFE_API_KEY, kind: process.env.JEV_DECIDER, gem: process.env.GEMINI_API_KEY };
+    const saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
     try {
-      delete process.env.TYPESAFE_API_KEY;
-      delete process.env.JEV_DECIDER;
-      delete process.env.GEMINI_API_KEY;
+      for (const k of KEYS) delete process.env[k];
       expect(makeDecider().name).toBe("mock");
       expect(makeDecider("").name).toBe("mock");
       expect(makeDecider("auto").name).toBe("mock");
       expect(makeDecider("solver").name).toBe("solver");
       expect(() => makeDecider("gemini")).toThrow(/GEMINI_API_KEY/);
+      expect(() => makeDecider("openai")).toThrow(/OPENAI_API_KEY/);
+      expect(() => makeDecider("clef")).toThrow(/CLOUDFLARE_ACCOUNT_ID/);
       process.env.GEMINI_API_KEY = "test-key";
       expect(makeDecider("auto").name).toBe("gemini");
       expect(makeDecider("gemini").name).toBe("gemini");
+      process.env.CLOUDFLARE_API_TOKEN = "t";
+      process.env.CLOUDFLARE_ACCOUNT_ID = "acct";
+      expect(makeDecider("auto").name).toBe("clef");
+      process.env.OPENAI_API_KEY = "sk";
+      expect(makeDecider("auto").name).toBe("openai");
       process.env.JEV_DECIDER = "solver";
       expect(makeDecider("").name).toBe("solver");
       expect(makeDecider("mock").name).toBe("mock");
       expect(() => makeDecider("jev")).toThrow(/TYPESAFE_API_KEY/);
       expect(() => makeDecider("nope")).toThrow(/Unknown decider/);
     } finally {
-      if (saved.key === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = saved.key;
-      if (saved.kind === undefined) delete process.env.JEV_DECIDER; else process.env.JEV_DECIDER = saved.kind;
-      if (saved.gem === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = saved.gem;
+      for (const k of KEYS) if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
     }
+  });
+});
+
+describe("decision-model HTTP deciders", () => {
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const noSleep = async () => {};
+
+  it("Clef: posts System One questions to Workers AI and maps the answers", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    const sent: Array<{ url: string; init: RequestInit }> = [];
+    const events: CallEvent[] = [];
+    const d = new ClefDecider({
+      apiKey: "cf-token", accountId: "acct1", sleep: noSleep,
+      fetch: (async (url: string, init: RequestInit) => {
+        sent.push({ url, init });
+        return json(200, {
+          success: true, errors: [],
+          result: {
+            model: "clef-flash",
+            answers: {
+              next_move: { type: "choice", choice: ids[1], probabilities: { [ids[0]!]: 0.2, [ids[1]!]: 0.8 }, confidence: 0.7 },
+              progress: { type: "score", score: 2.4, legend: {}, probabilities: {}, confidence: 0.5 },
+              dead_end: { type: "noul", noul: 0.05 },
+            },
+            usage: { input_tokens: 812, output_tokens: 0 },
+          },
+        });
+      }) as typeof fetch,
+    });
+    const dec = await d.decide(req, (e) => events.push(e));
+    expect(sent[0]!.url).toBe("https://api.cloudflare.com/client/v4/accounts/acct1/ai/run/@cf/cloudflare/clef-flash");
+    expect((sent[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer cf-token");
+    const body = JSON.parse(String(sent[0]!.init.body));
+    expect(body.model).toBe("clef-flash");
+    expect(body.questions.next_move).toMatchObject({ type: "choice", criteria: req.options });
+    expect(body.questions.progress.criteria).toHaveLength(5);
+    expect(body.questions.dead_end.type).toBe("noul");
+    expect(dec).toMatchObject({ choice: ids[1], confidence: 0.7, progress: 2.4, deadEnd: 0.05, source: "clef", model: "clef-flash", tokens: { input: 812, output: 0 } });
+    expect(events.map((e) => e.phase)).toEqual(["request", "response"]);
+    expect(JSON.stringify(events[0]!.payload)).not.toContain("cf-token");
+  });
+
+  it("Clef: retries 5xx then fails fast on 4xx", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    let n = 0;
+    const flaky = new ClefDecider({
+      apiKey: "t", accountId: "a", sleep: noSleep,
+      fetch: (async () => (++n === 1 ? json(503, { errors: [{ message: "busy" }] })
+        : json(200, { result: { model: "clef-flash", answers: { next_move: { type: "choice", choice: "x", probabilities: { x: 1 }, confidence: 1 } }, usage: { input_tokens: 1, output_tokens: 0 } } }))) as typeof fetch,
+    });
+    expect((await flaky.decide(req)).choice).toBe("x");
+    expect(n).toBe(2);
+    const bad = new ClefDecider({ apiKey: "t", accountId: "a", sleep: noSleep, fetch: (async () => { n++; return json(401, { errors: [{ message: "Authentication error" }] }); }) as typeof fetch });
+    await expect(bad.decide(req)).rejects.toThrow(/clef API 401 \(clef-flash\): Authentication error/);
+    expect(n).toBe(3);
+  });
+
+  it("OpenAI Decisions: sends choice/score/predicate questions and reads the answers array", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const ids = Object.keys(req.options);
+    const sent: Array<{ url: string; init: RequestInit }> = [];
+    const d = new OpenAIDecisionsDecider({
+      apiKey: "sk-test", sleep: noSleep,
+      fetch: (async (url: string, init: RequestInit) => {
+        sent.push({ url, init });
+        return json(200, {
+          model: "gpt-6-luna",
+          answers: [
+            { type: "choice", name: "next_move", choice: ids[0], probabilities: ids.map((v, i) => ({ value: v, probability: i === 0 ? 0.9 : 0.1 / (ids.length - 1) })), confidence: 0.88 },
+            { type: "score", name: "progress", score: 1.5, probabilities: [], confidence: 0.6 },
+            { type: "predicate", name: "dead_end", probability: 0.02 },
+          ],
+          usage: { input_tokens: 700, output_tokens: 0 },
+        });
+      }) as typeof fetch,
+    });
+    const dec = await d.decide(req);
+    expect(sent[0]!.url).toBe("https://api.openai.com/v1/decisions");
+    expect((sent[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer sk-test");
+    const body = JSON.parse(String(sent[0]!.init.body));
+    expect(body.model).toBe("gpt-6-luna");
+    expect(body.questions.map((q: { type: string }) => q.type)).toEqual(["choice", "score", "predicate"]);
+    expect(body.questions[0].choices).toHaveLength(ids.length);
+    expect(body.questions[0].choices[0]).toEqual({ value: ids[0], description: req.options[ids[0]!] });
+    expect(body.questions[1].levels).toHaveLength(5);
+    expect(dec).toMatchObject({ choice: ids[0], confidence: 0.88, progress: 1.5, deadEnd: 0.02, source: "openai", tokens: { input: 700, output: 0 } });
+    expect(dec.probabilities[ids[0]!]).toBeCloseTo(0.9);
+  });
+
+  it("OpenAI Decisions: uses the api-key header for Azure and rejects refusals", async () => {
+    const req = buildRequest(demo(), legalMoves(demo()));
+    const sent: Array<{ url: string; init: RequestInit }> = [];
+    const d = new OpenAIDecisionsDecider({
+      apiKey: "az", baseUrl: "https://me.openai.azure.com/openai/v1/", model: "luna-dep", sleep: noSleep,
+      fetch: (async (url: string, init: RequestInit) => { sent.push({ url, init }); return json(200, { answers: [{ type: "refusal", name: "next_move" }] }); }) as typeof fetch,
+    });
+    await expect(d.decide(req)).rejects.toThrow(/refused/);
+    expect(sent[0]!.url).toBe("https://me.openai.azure.com/openai/v1/decisions");
+    expect((sent[0]!.init.headers as Record<string, string>)["api-key"]).toBe("az");
+    expect(JSON.parse(String(sent[0]!.init.body)).model).toBe("luna-dep");
   });
 });
 
