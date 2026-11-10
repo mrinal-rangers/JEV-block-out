@@ -1,5 +1,6 @@
 import { choice, noul, score, TypeSafeClient } from "@typesafe-ai/sdk";
-import { applyMove, evaluate, moveId, obstruction, solve, type GameState, type Move } from "@jev-block-out/core";
+import { applyMove, evaluate, moveId, obstruction, type GameState, type Move } from "@jev-block-out/core";
+import { knownPlan, planFor } from "./plans.ts";
 
 /** One Jev System One round-trip for a turn: Choice (next move) + Score (progress) + Noul (dead end). */
 export interface DecisionRequest {
@@ -591,26 +592,27 @@ export class SolverDecider implements Decider {
   readonly name = "solver";
   async decide(req: DecisionRequest, trace?: CallTracer): Promise<Decision> {
     return traced(trace, { provider: "solver", model: "weighted A*", endpoint: "local", payload: localPayload(req) }, async () => {
-      const d = this.plan(req);
+      const d = await this.plan(req);
       return { status: 200, body: localAnswer(d), value: d };
     });
   }
 
-  private plan(req: DecisionRequest): Decision {
+  private async plan(req: DecisionRequest): Promise<Decision> {
     const t0 = performance.now();
-    const plan = solve(req.state, { maxNodes: 60_000, weight: 1 });
+    const cached = !!knownPlan(req.state);
+    const plan = await planFor(req.state);
     const ids = Object.keys(req.options);
-    const planned = plan.solved && plan.moves[0] ? moveId(plan.moves[0]) : undefined;
+    const planned = plan?.[0] ? moveId(plan[0]) : undefined;
     const pick = planned && planned in req.options ? planned : ids[0]!;
     return {
       choice: pick,
       probabilities: Object.fromEntries(ids.map((id) => [id, id === pick ? 1 : 0])),
       confidence: planned === pick ? 1 : 0,
       progress: null,
-      deadEnd: plan.reason === "no solution" ? 1 : 0,
+      deadEnd: null,
       latencyMs: Math.round(performance.now() - t0),
       tokens: { input: null, output: null },
-      model: `solver(${plan.solved ? plan.moves.length + " moves left" : plan.reason})`,
+      model: plan ? `solver(${plan.length} moves left${cached ? ", cached plan" : ""})` : "solver(gave up)",
       source: "mock",
     };
   }

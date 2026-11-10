@@ -14,6 +14,12 @@ System One decision model — with a live, watchable simulation of it solving le
 > its level data, track the board with our own rules engine, and play moves with adb.
 > Jev makes every move decision.
 
+### 🎬 50-second demo
+
+[![Watch the 50-second demo](./docs/media/demo-poster.png)](./docs/media/jev-block-out-demo.mp4)
+
+*Click the image to play [the demo video](./docs/media/jev-block-out-demo.mp4) (MP4, 1080p, 50 s).*
+
 ![Live arena: Gemini vs solver on level 1](./docs/viewer.png)
 
 ## How it works (Path B+)
@@ -96,7 +102,7 @@ Flags: `npm start -- --level 12 --port 5180 --no-emulator --no-levels --no-open 
 Requires Node ≥ 22.18 (runs TypeScript directly, no build step). Other commands:
 
 ```powershell
-npm test                       # 43 tests
+npm test                       # 50 tests
 npm run bridge                 # arena only → http://127.0.0.1:5173/?level=demo
 npm run play -- demo           # same run in the terminal
 ```
@@ -256,5 +262,7 @@ obtained yourself.
 
 ## Status
 
-M0–M3 built: everything runs in simulation, Jev integration is wired up and tested with a mock.
-Waiting on the TypeSafe API key and on-device verification — see [CHECKPOINTS.md](./CHECKPOINTS.md).
+M0–M3 are built, plus real-game mode. The real game streams into the arena via scrcpy and is
+played with adb drags. Level recognition, popup handling and a cached solver plan are all in place.
+Level 7 was solved on the real game in 40 moves (~46 s). Jev and Clef run once their keys are set
+(`TYPESAFE_API_KEY`, or `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`). See [CHECKPOINTS.md](./CHECKPOINTS.md).

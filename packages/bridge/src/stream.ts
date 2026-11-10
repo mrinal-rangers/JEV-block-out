@@ -79,6 +79,25 @@ export function frame(p: Pick<VideoPacket, "config" | "key" | "data">): Buffer {
 
 type Sink = (chunk: Buffer) => void;
 
+export type TouchAction = "down" | "up" | "move";
+
+/**
+ * scrcpy INJECT_TOUCH_EVENT control message (32 bytes): u8 type=2, u8 action, i64 pointer id, i32 x, i32 y,
+ * u16 width, u16 height (must equal the current video size), u16 pressure, u32 action button, u32 buttons.
+ */
+export function touchMessage(action: TouchAction, x: number, y: number, w: number, h: number): Buffer {
+  const b = Buffer.alloc(32);
+  b[0] = 2;
+  b[1] = { down: 0, up: 1, move: 2 }[action];
+  b.writeBigInt64BE(-2n, 2); // generic finger
+  b.writeInt32BE(Math.round(x), 10);
+  b.writeInt32BE(Math.round(y), 14);
+  b.writeUInt16BE(w, 18);
+  b.writeUInt16BE(h, 20);
+  b.writeUInt16BE(action === "up" ? 0 : 0xffff, 22);
+  return b;
+}
+
 /**
  * Streams the real device screen as H.264 via scrcpy-server over an adb forward tunnel.
  * New subscribers get the codec config plus the current group of pictures, so they can start decoding at once.
@@ -86,6 +105,7 @@ type Sink = (chunk: Buffer) => void;
 export class ScrcpyStream {
   private proc: ChildProcess | null = null;
   private sock: Socket | null = null;
+  private ctrl: Socket | null = null;
   private port = 0;
   private config: Buffer | null = null;
   private gop: Buffer[] = [];
@@ -116,16 +136,34 @@ export class ScrcpyStream {
     this.port = Number(String(stdout).trim());
     if (!this.port) throw new Error(`adb forward gave no port: ${stdout}`);
     this.proc = spawn(adb, this.adb(["shell", `CLASSPATH=${REMOTE_JAR}`, "app_process", "/", "com.genymobile.scrcpy.Server", SCRCPY_VERSION,
-      `scid=${scid}`, "log_level=info", "tunnel_forward=true", "audio=false", "control=false", "cleanup=false",
+      `scid=${scid}`, "log_level=info", "tunnel_forward=true", "audio=false", "control=true", "cleanup=false",
+      "clipboard_autosync=false", "power_off_on_close=false",
       "video_codec=h264", `max_size=${this.maxSize}`, "max_fps=30", "video_bit_rate=4000000",
-      "send_device_meta=false", "send_stream_meta=false"]), { stdio: ["ignore", "pipe", "pipe"] });
+      "send_device_meta=false", "send_stream_meta=true"]), { stdio: ["ignore", "pipe", "pipe"] });
     const keep = (d: Buffer) => { this.log.push(...String(d).split(/\r?\n/).filter(Boolean)); this.log = this.log.slice(-20); };
     this.proc.stdout!.on("data", keep);
     this.proc.stderr!.on("data", keep);
     this.proc.on("exit", () => this.end("scrcpy-server exited"));
     this.sock = await this.connectVideo();
+    // With a forward tunnel the control socket is the second connection, made right after the video one.
+    this.ctrl = await new Promise<Socket>((ok, fail) => {
+      const c = connect(this.port, "127.0.0.1", () => ok(c));
+      c.once("error", fail);
+    });
+    this.ctrl.on("data", () => {}); // device messages (clipboard etc.) are not used
+    this.ctrl.on("error", () => {});
+    this.ctrl.on("close", () => (this.ctrl = null));
     const parser = new PacketParser((p) => this.onPacket(p), (w, h) => (this.size = { w, h }));
-    this.sock.on("data", (d) => parser.feed(d));
+    // Stream meta: a u32 codec id, then a session packet carrying the video size (needed to inject touches).
+    let codecId = 4;
+    this.sock.on("data", (d: Buffer) => {
+      if (codecId > 0) {
+        const skip = Math.min(codecId, d.length);
+        codecId -= skip;
+        d = d.subarray(skip);
+      }
+      if (d.length) parser.feed(d);
+    });
     this.sock.on("close", () => this.end("video socket closed"));
     this.sock.on("error", () => {});
     this.sock.resume();
@@ -180,6 +218,41 @@ export class ScrcpyStream {
 
   get subscribers() { return this.sinks.size; }
 
+  /** True once touches can be injected (control socket open and the video size known). */
+  get canTouch() { return !!this.ctrl && !!this.size && !this.ended; }
+
+  /**
+   * Presses at the first point, glides through the rest and releases. Points are 0..1 fractions of the screen.
+   * Moves are sent every `stepMs` in ~1/100-of-height steps so the game sees a continuous finger. A drag takes at
+   * least `minDurationMs`: the game's blocks trail the finger, and a quick one-cell flick snaps back unmoved.
+   */
+  async gesture(points: { x: number; y: number }[], opts: { stepMs?: number; holdMs?: number; durationMs?: number; minDurationMs?: number } = {}): Promise<void> {
+    if (!this.canTouch || !points.length) throw new Error("scrcpy control is not ready");
+    const { w, h } = this.size!;
+    const stepMs = opts.stepMs ?? 12, holdMs = opts.holdMs ?? 40;
+    const px = points.map((p) => ({ x: p.x * w, y: p.y * h }));
+    const steps: { x: number; y: number }[] = [];
+    for (let i = 1; i < px.length; i++) {
+      const a = px[i - 1]!, b = px[i]!;
+      const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / (h / 100)));
+      for (let k = 1; k <= n; k++) steps.push({ x: a.x + ((b.x - a.x) * k) / n, y: a.y + ((b.y - a.y) * k) / n });
+    }
+    const minDt = steps.length ? (opts.minDurationMs ?? 300) / steps.length : 0;
+    const dt = opts.durationMs && steps.length ? opts.durationMs / steps.length : Math.max(stepMs, minDt);
+    const send = (a: TouchAction, p: { x: number; y: number }) => {
+      if (!this.ctrl) throw new Error("scrcpy control closed");
+      this.ctrl.write(touchMessage(a, Math.min(w - 1, Math.max(0, p.x)), Math.min(h - 1, Math.max(0, p.y)), w, h));
+    };
+    send("down", px[0]!);
+    await sleep(holdMs);
+    for (const p of steps) {
+      send("move", p);
+      await sleep(dt);
+    }
+    await sleep(holdMs);
+    send("up", px.at(-1)!);
+  }
+
   onceEnded(fn: (why: string) => void): () => void {
     this.onEnd.add(fn);
     return () => this.onEnd.delete(fn);
@@ -189,6 +262,7 @@ export class ScrcpyStream {
     if (this.ended) return;
     this.ended = true;
     this.sock?.destroy();
+    this.ctrl?.destroy();
     this.proc?.kill();
     if (this.port) run(adbPath(), this.adb(["forward", "--remove", `tcp:${this.port}`])).catch(() => {});
     for (const fn of this.onEnd) fn(why);

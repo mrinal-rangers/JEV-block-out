@@ -5,13 +5,14 @@ import { DEFAULT_AGENT_CONFIG, decideTurn, stateKey, type AgentConfig, type Turn
 import type { Device } from "./device.ts";
 import type { CallEvent, Decider } from "./jev.ts";
 import { newRunId, RunLog } from "./log.ts";
-import { dragPath, loadCalibration } from "./screen.ts";
+import { dragPath, loadCalibration, type Calibration } from "./screen.ts";
 
 export type RunEvent =
-  | { type: "start"; runId: string; level: string; decider: string; mode: "sim" | "device"; state: GameState }
+  | { type: "start"; runId: string; level: string; decider: string; mode: "sim" | "device"; state: GameState; calibration?: Calibration }
   | ({ type: "turn"; n: number; before: GameState; after: GameState; ms: number } & TurnResult)
   | ({ type: "call"; n: number } & CallEvent)
   | { type: "end"; status: string; turns: number; ms: number; reason?: string; state: GameState }
+  | { type: "info"; message: string }
   | { type: "error"; message: string };
 
 export interface RunOptions {
@@ -22,6 +23,8 @@ export interface RunOptions {
   maxTurns?: number;
   /** When set, every move is also dragged on the emulator and a settled screenshot is saved. */
   device?: Device;
+  /** Board-to-screen mapping for `device` (e.g. from level recognition); detected from a screenshot when omitted. */
+  calibration?: Calibration;
   onEvent?: (e: RunEvent) => void;
 }
 
@@ -55,14 +58,17 @@ export class Runner {
       opts.onEvent?.(e);
     };
     const shotsDir = resolve("shots", runId);
-    const cal = opts.device ? loadCalibration(start) : null;
-    if (opts.device) mkdirSync(shotsDir, { recursive: true });
+    const keepShots = process.env.JEV_SHOTS === "1";
+    const img = opts.device && !opts.calibration ? await opts.device.rawScreenshot().catch(() => null) : null;
+    const cal = opts.device ? (opts.calibration ?? loadCalibration(start, img)) : null;
+    if (opts.device && keepShots) mkdirSync(shotsDir, { recursive: true });
+    const moveWaitMs = Number(process.env.DEVICE_MOVE_MS) || 350;
 
     const t0 = Date.now();
     let s = evaluate(start);
     const seen = new Map<string, number>();
-    emit({ type: "start", runId, level: String(start.levelIndex ?? start.levelId), decider: opts.decider.name, mode: opts.device ? "device" : "sim", state: s });
-    if (opts.device) writeFileSync(join(shotsDir, "000.png"), await opts.device.settle());
+    emit({ type: "start", runId, level: String(start.levelIndex ?? start.levelId), decider: opts.decider.name, mode: opts.device ? "device" : "sim", state: s, ...(cal ? { calibration: cal } : {}) });
+    if (opts.device && keepShots) writeFileSync(join(shotsDir, "000.png"), await opts.device.screenshot());
 
     const end = (status: string, reason?: string) => {
       const e = { type: "end" as const, status, turns: s.moveCount, ms: Date.now() - t0, state: s, ...(reason ? { reason } : {}) };
@@ -95,7 +101,9 @@ export class Runner {
       s = applyLegal(s, turn.move);
       if (opts.device && cal) {
         await opts.device.drag(dragPath(cal, before, turn.move));
-        writeFileSync(join(shotsDir, `${String(n).padStart(3, "0")}.png`), await opts.device.settle());
+        // The game's timer and hints never let the screen go still, so wait a fixed time for the slide/exit animation.
+        await sleep(moveWaitMs);
+        if (keepShots) writeFileSync(join(shotsDir, `${String(n).padStart(3, "0")}.png`), await opts.device.screenshot());
       }
       emit({ type: "turn", n, before, after: s, ms: Date.now() - t1, ...turn });
       if (opts.stepDelayMs && !this.paused) await sleep(opts.stepDelayMs);

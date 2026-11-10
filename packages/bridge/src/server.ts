@@ -4,7 +4,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hasLevels, loadLevel, loadLevelMeta, parseLevel, type GameState } from "@jev-block-out/core";
 import { Device } from "./device.ts";
+import { findGameLevel, LevelIndex, type GameLevel } from "./game.ts";
 import { deciderConfigured, makeDecider } from "./jev.ts";
+import { planFor } from "./plans.ts";
 import { Runner, type RunEvent } from "./runner.ts";
 import { ScrcpyStream } from "./stream.ts";
 
@@ -25,13 +27,13 @@ export function availableDeciders(): Record<string, boolean> {
   return Object.fromEntries(["jev", "openai", "clef", "gemini", "mock", "solver"].map((k) => [k, deciderConfigured(k)]));
 }
 
-interface RunRequest { lane?: string; level?: string | number; decider?: string; delayMs?: number; device?: boolean; paused?: boolean; maxTurns?: number }
+interface RunRequest { lane?: string; level?: string | number; decider?: string; delayMs?: number; device?: boolean; keepPlaying?: boolean; paused?: boolean; maxTurns?: number }
 interface InputRequest { type?: string; x?: number; y?: number; x2?: number; y2?: number; ms?: number; key?: string }
 
 const unit = (v: unknown): v is number => typeof v === "number" && v >= 0 && v <= 1;
 
 /** One independent run shown as a column in the viewer. Several lanes can run in parallel. */
-interface Lane { runner: Runner | null; running: boolean; device: boolean; history: RunEvent[] }
+interface Lane { runner: Runner | null; running: boolean; device: boolean; stopped: boolean; history: RunEvent[] }
 
 const LANE_ID = /^[a-z0-9]{1,8}$/;
 
@@ -42,9 +44,11 @@ const LANE_ID = /^[a-z0-9]{1,8}$/;
  *   GET  /state         lanes and whether they are running
  *   GET  /levels        level list + available deciders + device status
  *   GET  /screen        PNG screenshot of the connected emulator
+ *   GET  /game          which level the real game is showing: {level, score} or {level: null}
  *   GET  /video         live H.264 stream of the real game (scrcpy), framed as u8 flags + u32 length + Annex B
  *   POST /input         {type: tap|swipe|key|launch, x, y, x2, y2 (0..1 of the screen), ms, key: back|home|appswitch}
- *   POST /run           {lane, level, decider, delayMs, device, paused, maxTurns}
+ *   POST /run           {lane, level, decider, delayMs, device, keepPlaying, paused, maxTurns}; with device the level
+ *                       is read from the game screen and keepPlaying continues as the game moves on to the next level
  *   POST /step | /pause | /resume | /stop   {lane?}; no lane = all lanes
  */
 export function startServer(port = Number(process.env.PORT ?? 5173)) {
@@ -52,8 +56,18 @@ export function startServer(port = Number(process.env.PORT ?? 5173)) {
   const lanes = new Map<string, Lane>();
   const lane = (id: string): Lane => {
     let l = lanes.get(id);
-    if (!l) lanes.set(id, (l = { runner: null, running: false, device: false, history: [] }));
+    if (!l) lanes.set(id, (l = { runner: null, running: false, device: false, stopped: false, history: [] }));
     return l;
+  };
+  const index = new LevelIndex();
+  // Recognising the game's level compares the screen against every extracted level; parse them up front.
+  if (hasLevels()) setTimeout(() => void index.all(), 500);
+  // Solve the game's current and next level in a worker while they are on screen, so play starts without waiting.
+  const prefetch = (level: number) => {
+    for (const n of [level, level + 1]) {
+      const s = index.get(n);
+      if (s) void planFor(s).catch(() => {});
+    }
   };
 
   const broadcast = (id: string, e: RunEvent) => {
@@ -71,10 +85,12 @@ export function startServer(port = Number(process.env.PORT ?? 5173)) {
       req.on("end", () => { try { ok(b ? JSON.parse(b) : {}); } catch { ok({} as T); } });
     });
 
-  // One shared scrcpy stream for every viewer; started on demand, stopped shortly after the last viewer leaves.
+  // One shared scrcpy stream for every viewer and for touch injection; started on demand, stopped shortly after the
+  // last viewer leaves unless a device run still needs it.
   let video: ScrcpyStream | null = null;
   let videoStarting: Promise<ScrcpyStream> | null = null;
   let videoIdle: NodeJS.Timeout | undefined;
+  let videoPins = 0;
   const getVideo = (): Promise<ScrcpyStream> => {
     if (video && !video.ended) return Promise.resolve(video);
     if (!videoStarting) {
@@ -84,6 +100,17 @@ export function startServer(port = Number(process.env.PORT ?? 5173)) {
         .finally(() => { videoStarting = null; });
     }
     return videoStarting;
+  };
+  const idleVideo = () => {
+    clearTimeout(videoIdle);
+    const s = video;
+    if (s && !s.subscribers && !videoPins) videoIdle = setTimeout(() => s.subscribers || videoPins || s.stop(), 15_000);
+  };
+  /** Touches through scrcpy's control socket (~1 s per drag instead of ~20 s with `adb shell input`). */
+  const gesture = async (points: { x: number; y: number }[], durationMs?: number) => {
+    const s = await getVideo();
+    for (let i = 0; i < 30 && !s.canTouch; i++) await new Promise((r) => setTimeout(r, 100));
+    await s.gesture(points, durationMs ? { durationMs } : {});
   };
   let screen: { w: number; h: number; at: number } | null = null;
   const screenSize = async (d: Device) => {
@@ -107,6 +134,7 @@ export function startServer(port = Number(process.env.PORT ?? 5173)) {
       }
       if (req.method === "GET" && url.pathname === "/events") {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+        res.write(": connected\n\n");
         for (const [id, l] of lanes) for (const e of l.history) res.write(`data: ${JSON.stringify({ lane: id, ...e })}\n\n`);
         clients.add(res);
         req.on("close", () => clients.delete(res));
@@ -138,9 +166,17 @@ export function startServer(port = Number(process.env.PORT ?? 5173)) {
         req.on("close", () => {
           unsub();
           offEnd();
-          if (!s.subscribers) videoIdle = setTimeout(() => s.subscribers || s.stop(), 15_000);
+          idleVideo();
         });
         return;
+      }
+      if (req.method === "GET" && url.pathname === "/game") {
+        const d = new Device();
+        if (!hasLevels() || !(await d.isConnected().catch(() => false))) return json(res, 200, { level: null });
+        const hint = Number(url.searchParams.get("hint")) || undefined;
+        const m = await findGameLevel(d, index, { hint, timeoutMs: 0, stable: false });
+        if (m) prefetch(m.level);
+        return json(res, 200, m ? { level: m.level, score: m.score } : { level: null });
       }
       if (req.method === "POST" && url.pathname === "/input") {
         const r = await body<InputRequest>(req);
@@ -152,10 +188,16 @@ export function startServer(port = Number(process.env.PORT ?? 5173)) {
           return json(res, 200, { ok: true });
         }
         if (!unit(r.x) || !unit(r.y)) return json(res, 400, { error: "x and y must be numbers in 0..1" });
-        const { w, h } = await screenSize(d);
-        if (r.type === "tap") await d.tap(r.x * w, r.y * h);
-        else if (r.type === "swipe" && unit(r.x2) && unit(r.y2)) await d.swipe(r.x * w, r.y * h, r.x2 * w, r.y2 * h, Math.max(50, Math.min(3000, Number(r.ms) || 300)));
-        else return json(res, 400, { error: "type must be tap, swipe (with x2, y2), key or launch" });
+        const swipe = r.type === "swipe" && unit(r.x2) && unit(r.y2);
+        if (r.type !== "tap" && !swipe) return json(res, 400, { error: "type must be tap, swipe (with x2, y2), key or launch" });
+        const ms = Math.max(50, Math.min(3000, Number(r.ms) || 300));
+        try {
+          await gesture(swipe ? [{ x: r.x, y: r.y }, { x: r.x2!, y: r.y2! }] : [{ x: r.x, y: r.y }], swipe ? ms : undefined);
+        } catch {
+          const { w, h } = await screenSize(d);
+          if (swipe) await d.swipe(r.x * w, r.y * h, r.x2! * w, r.y2! * h, ms);
+          else await d.tap(r.x * w, r.y * h);
+        }
         return json(res, 200, { ok: true });
       }
       if (req.method === "GET" && url.pathname === "/screen") {
@@ -173,23 +215,65 @@ export function startServer(port = Number(process.env.PORT ?? 5173)) {
         if (r.device && [...lanes.values()].some((o) => o !== l && o.running && o.device)) {
           return json(res, 409, { error: "the emulator is already used by another lane" });
         }
-        const start = loadAnyLevel(String(r.level ?? "demo"));
-        const device = r.device ? new Device() : undefined;
-        if (device && !(await device.isConnected())) return json(res, 400, { error: "no adb device" });
         const decider = makeDecider(r.decider);
+        const onEvent = (e: RunEvent) => broadcast(id, e);
+        if (r.device) {
+          const device = new Device();
+          if (!(await device.isConnected())) return json(res, 400, { error: "no adb device" });
+          if (!hasLevels()) return json(res, 400, { error: "Playing the real game needs the extracted levels — run `npm run levels -- <your.xapk>`" });
+          // Claim the lane before the (slow) screen search so a second /run can't race in.
+          Object.assign(l, { runner: null, running: true, device: true, stopped: false });
+          const first = await findGameLevel(device, index, { timeoutMs: 15_000, dismissPopups: true }).catch(() => null);
+          if (!first) Object.assign(l, { running: false, device: false });
+          if (!first) return json(res, 409, { error: "Can't recognise a level on the game screen — open the game on a level (no menu or popup) and try again" });
+          device.touch = (p) => gesture(p);
+          videoPins++;
+          clearTimeout(videoIdle);
+          (async () => {
+            let cur: GameLevel | null = first, tries = 0;
+            while (cur && !l.stopped) {
+              prefetch(cur.level);
+              const runner = (l.runner = new Runner());
+              if (r.paused && cur === first) runner.pause(true);
+              const e = await runner.run(cur.state, { decider, stepDelayMs: r.delayMs ?? 0, device, calibration: cur.calibration, maxTurns: r.maxTurns, onEvent });
+              if (!r.keepPlaying || l.stopped) break;
+              const won = e.status === "won";
+              tries = won ? 0 : tries + 1;
+              if (tries >= 3) { onEvent({ type: "error", message: `Level ${cur.level} failed 3 times in a row — stopped` }); break; }
+              const next: number = won ? cur.level + 1 : cur.level;
+              onEvent({ type: "info", message: won ? `Level ${cur.level} solved — waiting for the game to show the next level` : `Level ${cur.level} not solved (${e.status}) — retrying it` });
+              cur = await findGameLevel(device, index, {
+                hint: next, timeoutMs: 20_000, cancelled: () => l.stopped, dismissPopups: true,
+                onDismiss: (p) => onEvent({ type: "info", message: p === "continue"
+                  ? `Tapped the game's popup button ("Continue" after a win, "Try Again" after a fail)`
+                  : p === "home" ? `Tapped "Level N" on the game's home screen`
+                  : `Closed the game's "Out of Time" / "Continue?" popup (never spends coins) — the level will be retried` }),
+              });
+              if (cur && won && cur.level < next) onEvent({ type: "info", message: `The game is on level ${cur.level} again (it didn't count the win — out of time?) — replaying it` });
+              if (!cur && !l.stopped) onEvent({ type: "error", message: "The game did not show a level we recognise (a menu or popup we don't handle?) — stopped" });
+            }
+          })()
+            .catch((err) => onEvent({ type: "error", message: String(err) }))
+            .finally(() => { l.running = false; l.device = false; videoPins--; idleVideo(); });
+          return json(res, 202, { ok: true, lane: id, decider: decider.name, level: first.level });
+        }
+        const start = loadAnyLevel(String(r.level ?? "demo"));
         const runner = new Runner();
         if (r.paused) runner.pause(true);
-        Object.assign(l, { runner, running: true, device: !!device });
+        Object.assign(l, { runner, running: true, device: false, stopped: false });
         runner
-          .run(start, { decider, stepDelayMs: r.delayMs ?? 200, device, maxTurns: r.maxTurns, onEvent: (e) => broadcast(id, e) })
-          .catch((err) => broadcast(id, { type: "error", message: String(err) }))
-          .finally(() => { l.running = false; l.device = false; });
+          .run(start, { decider, stepDelayMs: r.delayMs ?? 200, maxTurns: r.maxTurns, onEvent })
+          .catch((err) => onEvent({ type: "error", message: String(err) }))
+          .finally(() => { l.running = false; });
         return json(res, 202, { ok: true, lane: id, decider: decider.name });
       }
       const control = { "/step": (x: Runner) => x.step(), "/pause": (x: Runner) => x.pause(true), "/resume": (x: Runner) => x.pause(false), "/stop": (x: Runner) => x.stop() }[url.pathname];
       if (req.method === "POST" && control) {
         const r = await body(req);
-        for (const l of targets(r)) if (l.runner) control(l.runner);
+        for (const l of targets(r)) {
+          if (url.pathname === "/stop") l.stopped = true;
+          if (l.runner) control(l.runner);
+        }
         return json(res, 200, { ok: true });
       }
       json(res, 404, { error: "not found" });

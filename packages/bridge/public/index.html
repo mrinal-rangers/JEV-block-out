@@ -60,21 +60,36 @@
 #emu canvas.on, #emu img.on { display:block; }
 #emu .lane-head button { padding:2px 8px; }
   #emu .muted { padding:8px 10px; }
-  @media (max-width: 1100px) { #arena { grid-template-columns:1fr; overflow:auto; } .lane { min-height:900px; } }
+  #emuScreen { position:relative; }
+  #emuCaption { position:absolute; left:8px; right:8px; bottom:8px; padding:6px 10px; border-radius:8px; background:rgba(10,12,18,.78); color:#fff; font:600 13px system-ui; pointer-events:none; display:none; }
+  #emuCaption.on { display:block; }
+  /* Real-game mode: the live game is the main view, next to one decider lane; the engine's board copy is optional. */
+  body:not(.game) .gameonly { display:none !important; } body.game .simonly { display:none !important; }
+  body.game #emu { display:flex; order:-1; border-right:1px solid var(--line); }
+  body.game #arena { grid-template-columns:clamp(300px, calc((100vh - 60px) * 0.47), 46vw) minmax(0, 1fr); }
+  body.game .lane ~ .lane { display:none; }
+  body.game:not(.showboard) .boardwrap { display:none; }
+  body.game:not(.showboard) .lane-top { grid-template-columns:1fr; }
+  @media (max-width: 1100px) { #arena, body.game #arena { grid-template-columns:1fr; overflow:auto; } .lane { min-height:900px; } body.game #emu { height:85vh; } }
 </style>
 </head>
 <body>
 <header>
   <h1>Jev × Block Out! <span class="muted">live arena</span></h1>
-  <label>Level <input id="level" list="levels" value="demo" size="7" title="level number or 'demo'" /></label>
+  <label title="Real game: the decider plays Block Out! on the emulator. Simulation: our engine plays extracted levels, several deciders side by side.">Mode
+    <select id="mode"><option value="game">Real game</option><option value="sim">Simulation</option></select></label>
+  <label class="simonly">Level <input id="level" list="levels" value="demo" size="7" title="level number or 'demo'" /></label>
   <datalist id="levels"><option value="demo">demo board</option></datalist>
+  <span class="gameonly pill" id="gameLevel" title="Recognised from the game screen">game level: …</span>
+  <label class="gameonly" title="When a level is solved, wait for the game to open the next one and keep going"><input id="keep" type="checkbox" checked /> keep playing</label>
+  <label class="gameonly" title="Also show the decider's own copy of the board"><input id="showBoard" type="checkbox" /> model board</label>
   <label>Move delay <input id="delay" type="number" value="200" min="0" step="50" style="width:72px" /> ms</label>
   <label>Max turns <input id="maxTurns" type="number" value="300" min="1" style="width:64px" /></label>
   <button class="primary" id="runAll">▶ Run all lanes</button>
   <button id="pause">Pause</button><button id="resume">Resume</button><button id="step">Step</button><button id="stop">Stop</button>
   <span class="spacer"></span>
-  <label title="Mirror the Android emulator screen (needs a running emulator with adb)"><input id="emuToggle" type="checkbox" /> Emulator</label>
-  <button id="addLane" title="Add another lane">+ lane</button>
+  <label class="simonly" title="Mirror the Android emulator screen (needs a running emulator with adb)"><input id="emuToggle" type="checkbox" /> Emulator</label>
+  <button class="simonly" id="addLane" title="Add another lane">+ lane</button>
 </header>
 <div id="arena">
   <section id="emu">
@@ -83,8 +98,8 @@
       <button id="emuLaunch" title="Open Block Out! on the emulator">▶ Game</button>
       <button id="emuBack" title="Android back">◀</button>
       <button id="emuHome" title="Android home">⌂</button></div>
-    <div id="emuScreen"><canvas id="emuCv" width="360" height="800"></canvas><img id="emuImg" alt="" /></div>
-    <div class="muted" id="emuNote">Live H.264 stream of the emulator (scrcpy). Click to tap, drag to swipe. Tick <b>device</b> on a lane to have its decider play the real game.</div>
+    <div id="emuScreen"><canvas id="emuCv" width="360" height="800"></canvas><img id="emuImg" alt="" /><div id="emuCaption"></div></div>
+    <div class="muted" id="emuNote">Live H.264 stream of the real game (scrcpy). Click to tap, drag to swipe.</div>
   </section>
 </div>
 
@@ -93,7 +108,7 @@
     <div class="lane-head">
       <span class="tag"></span>
       <select class="decider"></select>
-      <label class="muted" title="Also drag the moves on the Android emulator"><input type="checkbox" class="device" /> device</label>
+      <label class="muted simonly" title="Also drag the moves on the Android emulator"><input type="checkbox" class="device" /> device</label>
       <span class="pill status">idle</span>
       <span class="spacer"></span>
       <button class="run">Run</button><button class="stopOne">Stop</button><button class="close" title="Remove lane">✕</button>
@@ -283,17 +298,26 @@ setInterval(() => {
 }, 200);
 
 // ---------- lanes ----------
+const gameMode = () => document.body.classList.contains("game");
+function caption(text) { const c = $("emuCaption"); c.textContent = text || ""; c.classList.toggle("on", !!text); }
 function setStatus(L, text, cls) { const p = L.el.querySelector(".status"); p.textContent = text; p.className = "pill status " + (cls || ""); }
 function resetLane(L, e) {
-  L.queue = []; L.cards.clear(); L.calls = 0; L.latSum = 0; L.tokIn = 0; L.tokOut = 0; L.options = {}; L.t0 = Date.now(); L.running = true;
-  const el = L.el;
-  el.querySelector(".calls .list").innerHTML = ""; el.querySelector(".moves").innerHTML = ""; el.querySelector(".opts").innerHTML = "";
-  for (const k of ["turn", "conf", "prog", "dead", "lat", "tok"]) el.querySelector(".s-" + k).textContent = "–";
-  el.querySelector(".s-calls").textContent = "0"; el.querySelector(".s-left").textContent = e.state.blocks.length;
+  const el = L.el, more = e.mode === "device" && L.levelsDone > 0;
+  L.queue = []; L.options = {}; L.running = true;
+  if (!more) {
+    L.cards.clear(); L.calls = 0; L.latSum = 0; L.tokIn = 0; L.tokOut = 0; L.t0 = Date.now();
+    el.querySelector(".calls .list").innerHTML = ""; el.querySelector(".moves").innerHTML = "";
+    for (const k of ["conf", "prog", "dead", "lat", "tok"]) el.querySelector(".s-" + k).textContent = "–";
+    el.querySelector(".s-calls").textContent = "0";
+  }
+  el.querySelector(".opts").innerHTML = ""; el.querySelector(".s-turn").textContent = "–";
+  el.querySelector(".s-left").textContent = e.state.blocks.length;
+  el.querySelector(".moves").insertAdjacentHTML("beforeend", `<div style="color:var(--accent)">── level ${esc(e.level)} ──</div>`);
   el.querySelector(".banner").style.display = "none"; el.querySelector(".route").textContent = "";
-  el.querySelector(".chosen").textContent = `Level ${e.level} · ${e.decider} · ${e.mode} — thinking…`;
+  el.querySelector(".chosen").textContent = `Level ${e.level} · ${e.decider} · ${e.mode === "device" ? "real game" : "simulation"} — thinking…`;
+  if (e.mode === "device") { $("gameLevel").textContent = `game level: ${e.level}`; caption(`Level ${e.level} · ${e.decider} is thinking…`); }
   if (!q.get(L.id) || L.started) el.querySelector(".decider").value = e.decider;
-  L.started = true;
+  L.started = true; L.mode = e.mode; L.level = e.level;
   setStatus(L, "running", "running");
   draw(L.cv, e.state);
 }
@@ -322,18 +346,32 @@ async function pump(L) {
     const e = L.queue.shift();
     if (e.type === "turn") {
       showTurn(L, e);
-      await animateMove(L.cv, e.before, e.move, Math.min(600, +$("delay").value || 0));
+      if (L.mode === "device") caption(`Level ${L.level} · move ${e.n}: ${e.description}`);
+      if (L.mode !== "device" || document.body.classList.contains("showboard")) await animateMove(L.cv, e.before, e.move, Math.min(600, +$("delay").value || 0));
       draw(L.cv, e.after);
     } else if (e.type === "end") {
       L.running = false; draw(L.cv, e.state);
       const won = e.status === "won", b = L.el.querySelector(".banner");
       b.style.display = "block";
       b.textContent = won ? `✅ Solved in ${e.turns} moves · ${secs(e.ms)} · ${L.calls} calls` : `⏹ ${e.status}${e.reason ? " — " + e.reason.split("\n")[0] : ""} (${e.turns} moves)`;
-      L.el.querySelector(".s-time").textContent = secs(e.ms);
+      L.el.querySelector(".s-time").textContent = secs(Date.now() - L.t0);
       setStatus(L, won ? `won · ${e.turns} moves` : e.status, won ? "won" : "bad");
+      if (L.mode === "device") {
+        if (won) L.levelsDone = (L.levelsDone || 0) + 1;
+        L.el.querySelector(".moves").insertAdjacentHTML("beforeend", `<div style="color:${won ? "var(--ok)" : "var(--err)"}">${esc(b.textContent)}</div>`);
+        L.el.querySelector(".chosen").textContent = b.textContent;
+        caption(`Level ${L.level}: ${b.textContent}`);
+      }
+    } else if (e.type === "info") {
+      L.running = true;
+      L.el.querySelector(".moves").insertAdjacentHTML("beforeend", `<div style="color:var(--warn)">ℹ ${esc(e.message)}</div>`);
+      L.el.querySelector(".chosen").textContent = e.message; setStatus(L, "next level…", "running");
+      if (L.mode === "device") caption(e.message);
     } else if (e.type === "error") {
       L.el.querySelector(".moves").insertAdjacentHTML("beforeend", `<div style="color:var(--err)">⚠ ${esc(e.message)}</div>`);
+      if (L.mode === "device") { caption("⚠ " + e.message); setStatus(L, "stopped", "bad"); L.running = false; }
     }
+    const f = L.el.querySelector(".moves").parentElement; f.scrollTop = f.scrollHeight;
   }
   L.busy = false;
 }
@@ -378,11 +416,15 @@ async function post(path, body) {
   return r.json();
 }
 async function runLane(L) {
-  const j = await post("/run", { lane: L.id, level: $("level").value.trim() || "demo", decider: L.el.querySelector(".decider").value,
-    delayMs: +$("delay").value, maxTurns: +$("maxTurns").value || undefined, device: L.el.querySelector(".device").checked });
-  if (j.error) laneError(L, j.error);
+  const game = gameMode();
+  if (game) { L.levelsDone = 0; caption("Reading the level from the game screen…"); setStatus(L, "starting", "running"); }
+  const j = await post("/run", game
+    ? { lane: L.id, decider: L.el.querySelector(".decider").value, device: true, keepPlaying: $("keep").checked, maxTurns: +$("maxTurns").value || undefined }
+    : { lane: L.id, level: $("level").value.trim() || "demo", decider: L.el.querySelector(".decider").value,
+        delayMs: +$("delay").value, maxTurns: +$("maxTurns").value || undefined, device: L.el.querySelector(".device").checked });
+  if (j.error) { laneError(L, j.error); if (game) caption("⚠ " + j.error); }
 }
-$("runAll").onclick = () => { for (const L of lanes.values()) runLane(L); };
+$("runAll").onclick = () => { for (const L of lanes.values()) { runLane(L); if (gameMode()) break; } };
 $("pause").onclick = () => post("/pause"); $("resume").onclick = () => post("/resume"); $("step").onclick = () => post("/step"); $("stop").onclick = () => post("/stop");
 $("addLane").onclick = () => { const id = "abcdefgh".split("").find((c) => !lanes.has(c)); if (id) makeLane(id); };
 
@@ -490,10 +532,33 @@ $("emuLaunch").onclick = () => post("/input", { type: "launch" });
 $("emuBack").onclick = () => post("/input", { type: "key", key: "back" });
 $("emuHome").onclick = () => post("/input", { type: "key", key: "home" });
 $("emuToggle").onchange = () => {
-  const on = $("emuToggle").checked;
+  const on = $("emuToggle").checked || gameMode();
   $("emu").classList.toggle("on", on); layout();
   if (on) { startVideo(); refreshEmu(); } else stopVideo();
 };
+function setMode(m) {
+  document.body.classList.toggle("game", m === "game");
+  $("mode").value = m;
+  $("runAll").textContent = m === "game" ? "▶ Play the game" : "▶ Run all lanes";
+  for (const L of lanes.values()) L.el.querySelector(".run").textContent = m === "game" ? "Play" : "Run";
+  $("emuToggle").onchange();
+  if (m === "game") pollGame();
+}
+$("mode").onchange = () => setMode($("mode").value);
+$("showBoard").onchange = () => document.body.classList.toggle("showboard", $("showBoard").checked);
+// Shows which level the game is on while nothing is playing (recognised from a screenshot by the server).
+let polling = false;
+async function pollGame() {
+  if (polling || !gameMode() || [...lanes.values()].some((L) => L.running)) return;
+  polling = true;
+  try {
+    const j = await (await fetch("/game")).json();
+    $("gameLevel").textContent = j.level ? `game level: ${j.level}` : "game level: not on a level";
+    $("gameLevel").className = "pill " + (j.level ? "won" : "bad");
+  } catch {}
+  polling = false;
+}
+setInterval(pollGame, 4000);
 
 // ---------- boot ----------
 (async () => {
@@ -503,7 +568,8 @@ $("emuToggle").onchange = () => {
   if (q.get("delay")) $("delay").value = q.get("delay");
   const n = Math.max(1, Math.min(8, +(q.get("lanes") || 2)));
   for (let i = 0; i < n; i++) if (!lanes.has("abcdefgh"[i])) makeLane("abcdefgh"[i]);
-  if (info.device && q.get("emu") !== "0") { $("emuToggle").checked = true; $("emuToggle").onchange(); }
+  if (info.device && q.get("emu") !== "0") $("emuToggle").checked = true;
+  setMode(q.get("mode") || (info.device && info.extracted ? "game" : "sim"));
   const es = new EventSource("/events");
   es.onmessage = (m) => onEvent(JSON.parse(m.data));
   if (q.get("autorun")) setTimeout(() => $("runAll").click(), 300);

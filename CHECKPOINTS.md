@@ -20,7 +20,7 @@ checkpoint is completed. Detailed rationale lives in [AGENDA.md](./AGENDA.md).
 | M1 | Game state extraction | 4 / 5 (on-device check blocked on ToS) |
 | M2 | Move execution | 0 / 4 (all built and tested in sim; on-device blocked on ToS) |
 | M3 | Jev integration | 7 / 9 (first Jev / Clef solve needs an API key) |
-| M4 | Live simulation dashboard | 2 / 4 (4.2 partly done) |
+| M4 | Live simulation dashboard | 4 / 5 (4.2 partly done) |
 | M5 | Harder mechanics & evaluation | 0 / 4 (5.3 baseline started) |
 
 ---
@@ -83,7 +83,8 @@ x86_64 emulator.
 | 4.1 | Dashboard streaming decisions | 🤖 | ✅ | Live arena at `npm run bridge`: parallel lanes, live model-call feed (request/response), board animation, move list ([screenshot](./docs/viewer.png)) |
 | 4.2 | Probability bars, confidence, latency, cost | 🤖 | 🟨 | Bars, confidence, progress, P(dead end), latency and tokens done; cost pending real Jev usage |
 | 4.3 | scrcpy mirror + one-command `start` script | 🤖 | ✅ | Live H.264 game stream in the arena (scrcpy-server → `/video` → WebCodecs) with click/drag input (`/input`); `npm start` does everything in one command |
-| 4.4 | Demo recording in README | 👤🤖 | ⬜ | GIF/video linked |
+| 4.4 | Demo recording in README | 👤🤖 | ✅ | 50 s 1080p motion-graphics demo: [docs/media/jev-block-out-demo.mp4](./docs/media/jev-block-out-demo.mp4), linked from the README poster |
+| 4.5 | Real-game mode | 🤖 | ✅ | Real game is the main arena view. The arena recognises the level, closes popups, drives drags with 300 ms timing and caches solver plans. Level 7 was won on the real game in 40 moves (~46 s) |
 
 ## M5 — Harder mechanics & evaluation
 
@@ -112,3 +113,5 @@ x86_64 emulator.
 | 2026-11-08 | 4.1, 4.3 | Live arena: several deciders run in parallel lanes on one level. Every model call is traced (request, raw response, latency, tokens, errors) and streamed over SSE, with an optional emulator screenshot mirror. Gemini and the solver both solved level 1 side by side in 3 moves. |
 | 2026-11-08 | 3.9, 4.3 | Gemini was too slow (9–30 s per move), so fast decision models were added: Cloudflare Clef (free) and the OpenAI Decisions API, next to Jev. The default move delay is now 200 ms. The screenshot mirror was replaced with a live scrcpy H.264 stream decoded in the browser, with tap/swipe input. The user installs the game themselves. |
 | 2026-11-08 | 4.3 | `npm start`: loads the gitignored `.env`, reports which model keys are set, boots the emulator, extracts levels from the user's installed game, then starts the arena and opens the browser. Checked from a fresh clone: 1,296 levels were extracted and the arena ran. |
+| 2026-11-09 | 4.5 | Real-game mode: level recognition from the live frame, popup handling, cached solver plans in a worker, adb drag timing fixes. Level 7 solved on the real game. |
+| 2026-11-09 | 4.4 | 50 s landscape demo video rendered and added to `docs/media/`, with the poster linked in the README. |

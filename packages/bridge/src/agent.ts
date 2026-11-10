@@ -1,12 +1,11 @@
 import {
-  applyMove, COLOR_CHAR, describeMove, legalMoves, moveId, renderAscii, solve,
+  applyMove, COLOR_CHAR, describeMove, legalMoves, moveId, renderAscii,
   type GameState, type Move,
 } from "@jev-block-out/core";
 import type { CallTracer, Decider, Decision, DecisionRequest } from "./jev.ts";
+import { planFor, stateKey } from "./plans.ts";
 
-/** Position identity used for loop detection (block positions/colours + how many have exited). */
-export const stateKey = (s: GameState) =>
-  s.blocks.map((b) => `${b.id}:${b.color}:${b.cells[0]!.x},${b.cells[0]!.y}`).join("|") + `#${s.exited.length}`;
+export { stateKey };
 
 export interface AgentConfig {
   /** Below this, the agent re-asks Jev with only the top-k options. */
@@ -126,9 +125,9 @@ export async function decideTurn(
   if (second.confidence >= cfg.fallbackConfidence) return finish(pick, "reask", decisions);
 
   if (cfg.solverFallback) {
-    const plan = solve(s, { maxNodes: cfg.solverNodes, weight: 1 });
-    if (plan.solved && plan.moves.length) {
-      const m = plan.moves[0]!;
+    const plan = await planFor(s, [{ weight: 1, maxNodes: cfg.solverNodes }]);
+    if (plan?.length) {
+      const m = plan[0]!;
       const id = moveId(m);
       if (!(id in req.moves)) {
         // The solver's move can fall outside the 255-option cap; it is still legal (replayed through the engine).

@@ -21,8 +21,18 @@ export function adbPath(): string {
 export class Device {
   readonly serial: string | undefined;
   private readonly adb = adbPath();
+  private size: { w: number; h: number } | null = null;
+  /**
+   * Optional fast touch injector (scrcpy control socket) taking 0..1 screen fractions. Each `adb shell input` call
+   * starts a JVM (~1 s on emulators), so drags through it are slow; it remains the fallback.
+   */
+  touch?: (points: { x: number; y: number }[]) => Promise<void>;
   constructor(serial = process.env.ANDROID_SERIAL || undefined) {
     this.serial = serial;
+  }
+
+  private async cachedSize() {
+    return (this.size ??= await this.screenSize());
   }
 
   private args(a: string[]): string[] {
@@ -39,6 +49,16 @@ export class Device {
       encoding: "buffer", maxBuffer: 64 << 20,
     });
     return stdout as Buffer;
+  }
+
+  /** Uncompressed RGBA frame (`screencap` without -p): much faster than PNG and needs no decoder. */
+  async rawScreenshot(): Promise<{ w: number; h: number; data: Uint8Array }> {
+    const { stdout } = await run(this.adb, this.args(["exec-out", "screencap"]), { encoding: "buffer", maxBuffer: 64 << 20 });
+    const buf = stdout as Buffer;
+    const w = buf.readUInt32LE(0), h = buf.readUInt32LE(4);
+    const header = buf.length - w * h * 4;
+    if (!w || !h || header < 12 || header > 64) throw new Error("unexpected screencap format");
+    return { w, h, data: new Uint8Array(buf.buffer, buf.byteOffset + header, w * h * 4) };
   }
 
   async screenSize(): Promise<{ w: number; h: number }> {
@@ -69,6 +89,14 @@ export class Device {
   /** Press, move through each waypoint in small steps, release — one adb shell call so timing stays tight. */
   async drag(points: { x: number; y: number }[], stepPx = 40): Promise<void> {
     if (points.length < 2) return;
+    if (this.touch) {
+      try {
+        const { w, h } = await this.cachedSize();
+        return await this.touch(points.map((p) => ({ x: p.x / w, y: p.y / h })));
+      } catch {
+        // fall back to adb input below
+      }
+    }
     const cmds = [`input motionevent DOWN ${points[0]!.x} ${points[0]!.y}`];
     for (let i = 1; i < points.length; i++) {
       const a = points[i - 1]!, b = points[i]!;
